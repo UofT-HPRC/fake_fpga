@@ -1,11 +1,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <time.h>
-#include <unistd.h> //for usleep
+#include <poll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <termios.h>
+#include <errno.h>
 #include <vpi_user.h>
 
-#define TIME_SCALE (1.0/10e-9) //realtime seconds per simulation seconds
+#define TIME_SCALE (1.0/5e-7) //realtime seconds per simulation seconds
 
 typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
@@ -15,29 +20,57 @@ typedef struct _fake_fpga {
                          //Extra byte is for NUL character
     int ledrd_cb_reg; //Nonzero if ReadOnlySynch callback registered for printing led values
     
+    char button_vals[9]; //Keep track of button states for displaying
+    
+    vpiHandle keep_alive_cb_handle; //We need to cancel keep_alive callbacks
+    //when the simulation ends
+    
 } fake_fpga;
 
 static struct timespec sim_start; //Keeps track of real time
     
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
 
+//These variables hang onto the old tty state so we can return to it when 
+//quitting
+static int changed = 0;
+static struct termios old;
+
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
-    
     free(f);
+    
+    if (changed) {
+        tcsetattr(0, TCSANOW, &old);
+        changed = 0;
+    }
+    
+    vpi_printf("\nQuitting...\n");
     
     return 0;
 }
 
 static int start_of_sim(s_cb_data *dat) {
-    vpi_printf("Starting simulation with time scaling of 5 simulation ns per real-time second\n");
+    vpi_printf("Time scaling: %g sim seconds per real-time second\n\n\n", 1.0f/TIME_SCALE);
+    
+    if (!changed && isatty(STDIN_FILENO)) {
+        //Get current TTY attributes and save in old
+        tcgetattr(0, &old);
+        //Keep track of the fact that we are changing the tty settings
+        changed = 1;
+        //Copy the old settings and modify to turn off "cooked" mode and echoing
+        struct termios mod = old;
+        mod.c_lflag &= (~ECHO & ~ICANON);
+        tcsetattr(0, TCSANOW, &mod);
+    }
     
     clock_gettime(CLOCK_MONOTONIC, &sim_start);
     return 0;
 }
 
-//Cheesys helper function to generate nice LED display string
+
+//Cheesy helper function to generate nice LED display string
 char *led_disp(char const *binstr) {
     static char ret[160];
     char *p = ret;
@@ -53,42 +86,133 @@ char *led_disp(char const *binstr) {
     return ret;
 }
 
-//Dumb ReadWriteSynch callback that prints fpga state values
+//Cheesy helper function to generate nice button display string
+char *button_disp(char const *binstr) {
+    static char ret[160];
+    char *p = ret;
+    
+    int i;
+    for (i = 0; i < 8; i++) {
+        int incr;
+        int on = (binstr[i] == '1');
+        sprintf(p, "%s %n", on ? "^^" : "vv", &incr);
+        p += incr;
+    }
+    
+    return ret;
+}
+
+//Dumb ReadWriteSynch callback that prints fpga state values and checks for 
+//button presses
 static int rw_sync(s_cb_data *dat) {
     //Grab FPGA state from callback user data
-    fake_fpga *f = (fake_fpga*) dat->user_data;
+    fake_fpga *f = (fake_fpga*) dat->user_data;    
     
-    //If the simulation is running too fast, pause it for a while
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    
-    //TODO: make time scaling a run-time argument
-    double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
-                        + 1e-9 * (double) (now.tv_nsec - sim_start.tv_nsec));
-    double sim_time_ns = (double) dat->time->low / 1000.0;
-    double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
-    double disparity_us = (scaled_sim_time - real_time) * 1e6;
-    
-    int sleep_for = (int) disparity_us;
-    if (sleep_for > 10) {
-        usleep(sleep_for);
+    //Check for keypresses until it's time to update the display
+    while (1) {
+        //Get current time and compare with scaled sim time
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        
+        //TODO: make time scaling a run-time argument
+        double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
+                            + 1e-9 * (double) (now.tv_nsec - sim_start.tv_nsec));
+        double sim_time_ns = (double) dat->time->low / 1000.0;
+        double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
+        double disparity_ms = (scaled_sim_time - real_time) * 1e3;
+        
+        int sleep_for = (int) disparity_ms;
+        if (sleep_for < 5) sleep_for = 0; //If we would sleep for less than 5
+        //milliseconds, we'll use -1 in the poll timeout argument so it returns
+        //immediately
+        
+        
+        struct pollfd pfd = {
+            .fd = STDIN_FILENO,
+            .events = POLLIN
+        };
+        
+        int rc = poll(&pfd, 1, sleep_for);
+        if (rc < 0) {
+            vpi_printf("Error polling on stdin\n");
+            vpi_control(vpiFinish, 1);
+            return 0;
+        } else if (rc == 1) {
+            char c;
+            rc = read(STDIN_FILENO, &c, 1);
+            if (rc < 0) {
+                vpi_printf("Error reding stdin: %s\n", strerror(errno));
+                vpi_control(vpiFinish, 1);
+                return 0;
+            }
+            
+            if ('1' <= c && c <= '8') {
+                int ind = c - '1';
+                f->button_vals[ind] ^= 1;
+                
+                s_vpi_value button_vals = {
+                    .format = vpiBinStrVal,
+                    .value = {
+                        f->button_vals
+                    }
+                };
+                
+                vpi_put_value(f->buttons, &button_vals, NULL, vpiNoDelay);
+            } else if (c == 'q') {
+                //Disable keep-alive callback (though I don't think this is
+                //actually necessary; vpiFinish should do the trick
+                vpi_remove_cb(f->keep_alive_cb_handle);
+                
+                //End sim when user presses q
+                vpi_control(vpiFinish, 0);
+                return 0;
+            }
+        } else {
+            //No keypresses and we're up to date
+            break;
+        }
     }
     
     //Time+value info
-    //vpi_printf("At time %05u, value = %s\n", dat->time->low, f->led_new_val);
-    vpi_printf("\r%s", led_disp(f->led_new_val));
+    vpi_printf("\e[2A\r%s, time = %u        \n%s\n 1  2  3  4  5  6  7  8", 
+        led_disp(f->led_new_val), 
+        dat->time->low, 
+        button_disp(f->button_vals)
+    );
     vpi_mcd_flush(1);
     
     //Mark that we've finished the callback
     f->ledrd_cb_reg = 0;
     
-    //End simulation past a certain point
-    if (dat->time->low >= 50000) {
-        vpi_control(vpiFinish, 1);
-    }
-    
     
     return 0;
+}
+
+//Helper function to register fake FPGA input/output callback
+static void reg_rw_sync_cb(fake_fpga *f) {
+    //Register printer callback, if not already done
+    if (f->ledrd_cb_reg == 0) {
+        //Desired time units
+        s_vpi_time time_type = {
+            .type = vpiSimTime
+        };
+        
+        //Callback info for printing LED value at end of sim time
+        s_cb_data cbdat = {
+            .reason = cbReadWriteSynch,
+            .cb_rtn = rw_sync,
+            .time = &time_type,
+            .user_data = (char *) f
+        };
+        
+        //Register the callback
+        vpiHandle cb_handle = vpi_register_cb(&cbdat);
+        //We'll never need this handle, so free it
+        vpi_free_object(cb_handle);
+        
+        //Don't re-register printer callback
+        f->ledrd_cb_reg = 1;
+    }
 }
 
 //Value-change callback which registers a printer callback for the end of
@@ -106,31 +230,48 @@ static int value_change(s_cb_data *dat) {
     //Update the LED value string
     strncpy(f->led_new_val, dat->value->value.str, 8);
     
-    //Register printer callback, if not already done
-    if (f->ledrd_cb_reg == 0) {
-        //Desired time units
-        s_vpi_time time_type = {
-            .type = vpiSimTime
-        };
-        
-        //Callback info for printing LED value at end of sim time
-        s_cb_data cbdat = {
-            .reason = cbReadOnlySynch,
-            .cb_rtn = rw_sync,
-            .time = &time_type,
-            .user_data = (char *) f
-        };
-        
-        //Register the callback
-        vpiHandle cb_handle = vpi_register_cb(&cbdat);
-        //We'll never need this handle, so free it
-        vpi_free_object(cb_handle);
-        
-        //Don't re-register printer callback
-        f->ledrd_cb_reg = 1;
-    }
+    //Register fake I/O update callback
+    reg_rw_sync_cb(f);
     
     return 0;
+}
+
+//Prototype to fix circular dependency
+static void reg_keep_alive_cb(fake_fpga *f);
+
+//Callback called every 5000 sim ticks just to make sure the simulation 
+//stays open.
+static int keep_alive(s_cb_data *dat) {
+    fake_fpga *f = (fake_fpga*) dat->user_data;
+    
+    //Old handle is no longer meaningful, so free it:
+    vpi_free_object(f->keep_alive_cb_handle);
+    //Register a new keep-alive callback
+    reg_keep_alive_cb(f);
+    
+    //Register callback for updating I/O
+    reg_rw_sync_cb(f);
+    
+    return 0;
+}
+
+//Helper function to register a keep-alive callback. This is actually just
+//a cbAfterDelay callback for 5000 sim ticks
+static void reg_keep_alive_cb(fake_fpga *f) {
+    s_vpi_time delay = {
+        .type = vpiSimTime,
+        .low = 5000,
+        .high = 0
+    };
+    
+    s_cb_data cbdat = {
+        .reason = cbAfterDelay,
+        .cb_rtn = keep_alive,
+        .time = &delay,
+        .user_data = (char *) f
+    };
+    
+    f->keep_alive_cb_handle = vpi_register_cb(&cbdat);
 }
 
 //Helper function to register a value-change callback
@@ -196,6 +337,7 @@ static int my_compiletf(char* user_data) {
     f->leds = leds;
     f->vc_cb_reg = 0;
     f->ledrd_cb_reg = 0;
+    strcpy(f->button_vals, "00000000");
     
     //Attach the allocated FPGA state struct to this task call instance
     vpi_put_userdata(self, f);
@@ -240,12 +382,15 @@ static int my_calltf(char* user_data) {
     s_vpi_value init_buttons = {
         .format = vpiBinStrVal,
         .value = {
-            .str = "00001000"
+            .str = f->button_vals
         }
     };
     
     //Apply initial button values immediately
     vpi_put_value(f->buttons, &init_buttons, NULL, vpiNoDelay);
+    
+    //Also hook up our keep-alive callback
+    reg_keep_alive_cb(f);
     
     return 0;
 }

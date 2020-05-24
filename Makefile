@@ -11,7 +11,10 @@ hello.vvp:	hello.v
 
 run: hello.vvp my_task.vpi
 	vvp -M. -mmy_task hello.vvp
-	
+
+debug: hello.vvp my_task.vpi
+	gdb --args vvp -M. -mmy_task hello.vvp
+
 clean:
 	rm -rf *.o
 	rm -rf *.vpi
