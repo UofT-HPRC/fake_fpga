@@ -5,15 +5,18 @@
 #include <unistd.h> //for usleep
 #include <vpi_user.h>
 
-typedef struct {
+typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
     int vc_cb_reg; //Nonzero if LED value change callback already registered
     
     char led_new_val[9]; //String containing latest LED values, or NULL if nothing changed 
                          //Extra byte is for NUL character
-    int ledrd_cb_reg; //Nonzero if ReadOnlyynch callback registered for printing led values
+    int ledrd_cb_reg; //Nonzero if ReadOnlySynch callback registered for printing led values
+    
 } fake_fpga;
 
+static struct timespec sim_start; //Keeps track of real time
+    
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
 
 //Frees all the fake_fpga instances
@@ -26,13 +29,37 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
     return 0;
 }
 
+static int start_of_sim(s_cb_data *dat) {
+    vpi_printf("Starting simulation with time scaling of 5 simulation ns per real-time second\n");
+    
+    clock_gettime(CLOCK_MONOTONIC, &sim_start);
+    return 0;
+}
+
 //Dumb ReadWriteSynch callback that prints fpga state values
 static int rw_sync(s_cb_data *dat) {
     //Grab FPGA state from callback user data
     fake_fpga *f = (fake_fpga*) dat->user_data;
     
+    //If the simulation is running too fast, pause it for a while
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    
+    //TODO: make time scaling a run-time argument
+    double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
+                        + 1e-9 * (double) (now.tv_nsec - sim_start.tv_nsec));
+    double sim_time_ns = (double) dat->time->low / 1000.0;
+    double scaled_sim_time = sim_time_ns / 5.0;
+    double disparity_us = (scaled_sim_time - real_time) * 1e6;
+    
+    int sleep_for = (int) disparity_us;
+    if (sleep_for > 10) {
+        usleep(sleep_for);
+    }
+    
     //Time+value info
     vpi_printf("At time %05u, value = %s\n", dat->time->low, f->led_new_val);
+    vpi_mcd_flush(1);
     
     //Mark that we've finished the callback
     f->ledrd_cb_reg = 0;
@@ -41,6 +68,7 @@ static int rw_sync(s_cb_data *dat) {
     if (dat->time->low >= 50000) {
         vpi_control(vpiFinish, 1);
     }
+    
     
     return 0;
 }
@@ -219,7 +247,23 @@ void my_task_register() {
     vpi_register_systf(&tf_data);
 }
 
+void start_of_sim_cb_register() {
+    s_vpi_time time_type = {
+        .type = vpiSimTime
+    };
+    
+    s_cb_data cbdat = {
+        .reason = cbStartOfSimulation,
+        .cb_rtn = start_of_sim,
+        .time = &time_type
+    };
+    
+    vpiHandle cb_handle = vpi_register_cb(&cbdat);
+    vpi_free_object(cb_handle);
+}
+
 void (*vlog_startup_routines[])() = {
     my_task_register,
+    start_of_sim_cb_register,
     NULL
 };
