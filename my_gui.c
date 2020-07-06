@@ -14,11 +14,27 @@ static double const *led_states[8];
 
 static gboolean print_msg(GtkSwitch *sw, gboolean state, gpointer data) {
     double const **ls = (double const **) data;
-    int ind = ls - led_states;
-    g_print ("Switch %d was turned %s\n", ind, state ? "on" : "off");
-    //*ls = (state == TRUE) ? led_on : led_off;
-    //gtk_widget_queue_draw(leds[ind]);
+    int ind = ls - led_states;    
+    
+    //Signal to the sim that the switches have changed
+    pthread_mutex_lock(&inputs.mutex);
+    inputs.changed = 1;
+    inputs.switch_states[ind] = state;
+    pthread_cond_signal(&inputs.cond);
+    pthread_mutex_unlock(&inputs.mutex);
     return 0;
+}
+
+static void button_clicked (GtkButton *button, gpointer user_data) {
+    GtkWidget *window = (GtkWidget*) user_data;
+    gtk_widget_destroy(window);
+    
+    //Signal to the sim that it should quit
+    pthread_mutex_lock(&inputs.mutex);
+    inputs.changed = 1;
+    inputs.quit_sim = 1;
+    pthread_cond_signal(&inputs.cond);
+    pthread_mutex_unlock(&inputs.mutex);
 }
 
 static gboolean draw_callback (GtkWidget *widget, cairo_t *cr, gpointer data) {    
@@ -48,6 +64,7 @@ static gboolean draw_callback (GtkWidget *widget, cairo_t *cr, gpointer data) {
 static void activate(GtkApplication *app, gpointer user_data) {
     GtkWidget *window;
     GtkWidget *grid;
+    GtkWidget *button;
 
     window = gtk_application_window_new (app);
     gtk_window_set_title (GTK_WINDOW (window), "Window");
@@ -72,6 +89,11 @@ static void activate(GtkApplication *app, gpointer user_data) {
         g_signal_connect(sws[i], "state-set", G_CALLBACK (print_msg), &(led_states[i]));
         gtk_grid_attach(GTK_GRID(grid), sws[i], i, 1, 1, 1);
     }
+    
+    button = gtk_button_new_with_label("Quit");
+    g_signal_connect(button, "clicked", G_CALLBACK(button_clicked), window);
+    gtk_grid_attach(GTK_GRID(grid), button, 2,2,4,1);
+    
     gtk_widget_show_all (window);
 }
 
@@ -99,6 +121,7 @@ static int update_LEDs_gtk_thread(void *arg) {
         }
     }
     
+    free(new_vals);
     return G_SOURCE_REMOVE;
 }
 

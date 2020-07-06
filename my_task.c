@@ -6,13 +6,22 @@
 #include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
-#include <termios.h>
 #include <errno.h>
 #include <vpi_user.h>
 #include <pthread.h>
 #include "my_gui.h"
 
 #define TIME_SCALE (1.0/5e-8) //realtime seconds per simulation seconds
+
+gui_inputs inputs = {
+    .changed = 0,
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .cond = PTHREAD_COND_INITIALIZER,
+    
+    .switch_states = {0, 0, 0, 0, 0, 0, 0, 0},
+    
+    .quit_sim = 0
+};
 
 typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
@@ -33,22 +42,12 @@ static struct timespec sim_start; //Keeps track of real time
     
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
 
-//These variables hang onto the old tty state so we can return to it when 
-//quitting
-static int changed = 0;
-static struct termios old;
-
 static pthread_t gui_tid;
 
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
     free(f);
-    
-    if (changed) {
-        tcsetattr(0, TCSANOW, &old);
-        changed = 0;
-    }
     
     vpi_printf("\nQuitting...\n");
     
@@ -60,18 +59,15 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
 static int start_of_sim(s_cb_data *dat) {
     vpi_printf("Time scaling: %g sim seconds per real-time second\n\n\n", 1.0f/TIME_SCALE);
     
-    if (!changed && isatty(STDIN_FILENO)) {
-        //Get current TTY attributes and save in old
-        tcgetattr(0, &old);
-        //Keep track of the fact that we are changing the tty settings
-        changed = 1;
-        //Copy the old settings and modify to turn off "cooked" mode and echoing
-        struct termios mod = old;
-        mod.c_lflag &= (~ECHO & ~ICANON);
-        tcsetattr(0, TCSANOW, &mod);
-    }
-    
     clock_gettime(CLOCK_MONOTONIC, &sim_start);
+    
+    //VERY SUBTLE: you need to set the attribute for pthread condition
+    //variables to match the clock you're using
+    //Code adapted from https://stackoverflow.com/a/14397906/2737696
+    pthread_condattr_t attr;
+    pthread_condattr_init(&attr);
+    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+    pthread_cond_init(&inputs.cond, &attr);
     
     //Fire up the GUI
     pthread_create(&gui_tid, NULL, start_gtk, NULL);
@@ -129,58 +125,85 @@ static int rw_sync(s_cb_data *dat) {
                             + 1e-9 * (double) (now.tv_nsec - sim_start.tv_nsec));
         double sim_time_ns = (double) dat->time->low / 1000.0;
         double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
-        double disparity_ms = (scaled_sim_time - real_time) * 1e3;
+        double disparity = (scaled_sim_time - real_time);
         
-        int sleep_for = (int) disparity_ms;
-        if (sleep_for < 5) sleep_for = 0; //If we would sleep for less than 5
-        //milliseconds, we'll use 0 in the poll timeout argument so it returns
-        //immediately
+        long end_nsec = now.tv_nsec + (long) (disparity * 1e9);
+        long end_sec = end_nsec/1000000000L;
+        end_nsec %= 1000000000L;
         
-        
-        struct pollfd pfd = {
-            .fd = STDIN_FILENO,
-            .events = POLLIN
+        //Subtle: pthread_cond_timedwait takes an absolute time, not a 
+        //relative time
+        struct timespec abs_end_time = {
+            .tv_sec = now.tv_sec + end_sec,
+            .tv_nsec = end_nsec
         };
         
-        int rc = poll(&pfd, 1, sleep_for);
-        if (rc < 0) {
-            vpi_printf("Error polling on stdin\n");
-            vpi_control(vpiFinish, 1);
-            return 0;
-        } else if (rc == 1) {
-            char c;
-            rc = read(STDIN_FILENO, &c, 1);
-            if (rc < 0) {
-                vpi_printf("Error reding stdin: %s\n", strerror(errno));
-                vpi_control(vpiFinish, 1);
-                return 0;
+        int nochange = 0;
+        int do_quit;
+        char sw_str[9];
+        sw_str[8] = 0;
+        
+        pthread_mutex_lock(&inputs.mutex);
+        while (!inputs.changed) {
+            int rc;
+            if (disparity < 5e-3) {
+                //Don't bother waiting if the time is less than 5 ms
+                rc = ETIMEDOUT;
+            } else {
+                //Wait on the condition variable for a maximum amount of time
+                rc = pthread_cond_timedwait(&inputs.cond, &inputs.mutex, &abs_end_time);
             }
             
-            if ('1' <= c && c <= '8') {
-                int ind = c - '1';
-                f->button_vals[ind] ^= 1;
-                
-                s_vpi_value button_vals = {
-                    .format = vpiBinStrVal,
-                    .value = {
-                        f->button_vals
-                    }
-                };
-                
-                vpi_put_value(f->buttons, &button_vals, NULL, vpiNoDelay);
-            } else if (c == 'q') {
-                //Disable keep-alive callback (though I don't think this is
-                //actually necessary; vpiFinish should do the trick
-                vpi_remove_cb(f->keep_alive_cb_handle);
-                
-                //End sim when user presses q
-                vpi_control(vpiFinish, 0);
-                return 0;
+            if (rc == ETIMEDOUT) {
+                //Remember that the simulation is halted as long as we're in
+                //this while loop. If waiting for the condition variable timed
+                //out, we should allow the simulation to continue. For example,
+                //the design might have a clock in it.
+                nochange = 1;
+                break;
+            } else if (rc != 0) {
+                perror("Could not issue timed wait");
+                do_quit = 1;
+                break;
             }
-        } else {
-            //No keypresses and we're up to date
-            break;
+            
+            //Make local copies (for thread safety)
+            do_quit = inputs.quit_sim;
+            int i;
+            for (i = 0; i < 8; i++) {
+                sw_str[i] = inputs.switch_states[i] ? '1' : '0';
+                //For now, update button_vals inside the fake_fpga struct.
+                //But soon that will all go away
+                f->button_vals[i] = sw_str[i];
+            }
         }
+        //Mark that we noticed the inputs changed
+        inputs.changed = 0;
+        pthread_mutex_unlock(&inputs.mutex);
+        
+        if (nochange) {
+            //Allow simulation to continue
+            break;
+        } else if (do_quit) {
+            //Disable keep-alive callback (though I don't think this is
+            //actually necessary; vpiFinish should do the trick
+            vpi_remove_cb(f->keep_alive_cb_handle);
+            
+            //End sim
+            vpi_control(vpiFinish, 0);
+            return 0;
+        } else {
+            //Button input            
+            s_vpi_value sw_vals = {
+                .format = vpiBinStrVal,
+                .value = {
+                    sw_str
+                }
+            };
+            
+            vpi_put_value(f->buttons, &sw_vals, NULL, vpiNoDelay);
+        }
+        break;
     }
     
     //Time+value info
