@@ -9,8 +9,10 @@
 #include <termios.h>
 #include <errno.h>
 #include <vpi_user.h>
+#include <pthread.h>
+#include "my_gui.h"
 
-#define TIME_SCALE (1.0/5e-7) //realtime seconds per simulation seconds
+#define TIME_SCALE (1.0/5e-8) //realtime seconds per simulation seconds
 
 typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
@@ -36,6 +38,8 @@ static struct timespec sim_start; //Keeps track of real time
 static int changed = 0;
 static struct termios old;
 
+static pthread_t gui_tid;
+
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
@@ -47,6 +51,8 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
     }
     
     vpi_printf("\nQuitting...\n");
+    
+    pthread_join(gui_tid, NULL);
     
     return 0;
 }
@@ -66,6 +72,10 @@ static int start_of_sim(s_cb_data *dat) {
     }
     
     clock_gettime(CLOCK_MONOTONIC, &sim_start);
+    
+    //Fire up the GUI
+    pthread_create(&gui_tid, NULL, start_gtk, NULL);
+    
     return 0;
 }
 
@@ -396,7 +406,6 @@ static int my_calltf(char* user_data) {
 }
 
 //Nitty-gritty VPI stuff for setting up custom tasks
-
 void my_task_register() {
     s_vpi_systf_data tf_data = {
         .type      = vpiSysTask,
