@@ -133,7 +133,7 @@ static int rw_sync(s_cb_data *dat) {
         
         int sleep_for = (int) disparity_ms;
         if (sleep_for < 5) sleep_for = 0; //If we would sleep for less than 5
-        //milliseconds, we'll use -1 in the poll timeout argument so it returns
+        //milliseconds, we'll use 0 in the poll timeout argument so it returns
         //immediately
         
         
@@ -220,7 +220,7 @@ static void reg_rw_sync_cb(fake_fpga *f) {
         //We'll never need this handle, so free it
         vpi_free_object(cb_handle);
         
-        //Don't re-register printer callback
+        //Signal that the callback is registered so we don't re-register it
         f->ledrd_cb_reg = 1;
     }
 }
@@ -239,6 +239,7 @@ static int value_change(s_cb_data *dat) {
     
     //Update the LED value string
     strncpy(f->led_new_val, dat->value->value.str, 8);
+    update_LEDs(dat->value->value.str);
     
     //Register fake I/O update callback
     reg_rw_sync_cb(f);

@@ -1,4 +1,6 @@
 #include <gtk/gtk.h>
+#include <string.h>
+#include "my_gui.h"
 
 //Named colour constants for LEDs
 static double const led_on[3] = {1.0, 0.0, 0.2};
@@ -14,8 +16,8 @@ static gboolean print_msg(GtkSwitch *sw, gboolean state, gpointer data) {
     double const **ls = (double const **) data;
     int ind = ls - led_states;
     g_print ("Switch %d was turned %s\n", ind, state ? "on" : "off");
-    *ls = (state == TRUE) ? led_on : led_off;
-    gtk_widget_queue_draw(leds[ind]);
+    //*ls = (state == TRUE) ? led_on : led_off;
+    //gtk_widget_queue_draw(leds[ind]);
     return 0;
 }
 
@@ -83,4 +85,26 @@ void *start_gtk (void *arg){
     g_object_unref (app);
 
     return NULL;
+}
+
+static int update_LEDs_gtk_thread(void *arg) {
+    char *new_vals = (char *) arg;
+    
+    int i;
+    for (i = 0; i < 8; i++) {
+        int change = (new_vals[i] == '1') ^ (led_states[i] == led_on);
+        if (change) {
+            led_states[i] = (new_vals[i] == '1') ? led_on : led_off;
+            gtk_widget_queue_draw(leds[i]);
+        }
+    }
+    
+    return G_SOURCE_REMOVE;
+}
+
+void update_LEDs(char *ledstr) {
+    char *local_copy = malloc(8);
+    strncpy(local_copy, ledstr, 8);
+    gdk_threads_add_idle(update_LEDs_gtk_thread, local_copy);
+    //printf("Got LED update: %s\n", ledstr);
 }
