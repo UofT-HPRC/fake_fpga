@@ -3,25 +3,46 @@
 #include <string.h>
 #include <ctype.h>
 #include <time.h>
-#include <poll.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <errno.h>
 #include <vpi_user.h>
-#include <pthread.h>
-#include "my_gui.h"
+//#include <event2/event.h>
+#ifdef _WIN32
+#include <winsock2.h>
+#else
+#include <sys/socket.h>
+#endif
 
-#define TIME_SCALE (1.0/5e-8) //realtime seconds per simulation seconds
+#ifdef _WIN32
+//From https://stackoverflow.com/a/26085827/2737696
 
-gui_inputs inputs = {
-    .changed = 0,
-    .mutex = PTHREAD_MUTEX_INITIALIZER,
-    .cond = PTHREAD_COND_INITIALIZER,
-    
-    .switch_states = {0, 0, 0, 0, 0, 0, 0, 0},
-    
-    .quit_sim = 0
-};
+#include <stdint.h> // portable: uint64_t   MSVC: __int64 
+
+int gettimeofday(struct timeval * tp, struct timezone * tzp)
+{
+    // Note: some broken versions only have 8 trailing zero's, the correct epoch has 9 trailing zero's
+    // This magic number is the number of 100 nanosecond intervals since January 1, 1601 (UTC)
+    // until 00:00:00 January 1, 1970 
+    static const uint64_t EPOCH = ((uint64_t) 116444736000000000ULL);
+
+    SYSTEMTIME  system_time;
+    FILETIME    file_time;
+    uint64_t    time;
+
+    GetSystemTime( &system_time );
+    SystemTimeToFileTime( &system_time, &file_time );
+    time =  ((uint64_t)file_time.dwLowDateTime )      ;
+    time += ((uint64_t)file_time.dwHighDateTime) << 32;
+
+    tp->tv_sec  = (long) ((time - EPOCH) / 10000000L);
+    tp->tv_usec = (long) (system_time.wMilliseconds * 1000);
+    return 0;
+}
+
+#endif
+
+#define TIME_SCALE (1.0/5e-9) //realtime seconds per simulation seconds
 
 typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
@@ -38,20 +59,32 @@ typedef struct _fake_fpga {
     
 } fake_fpga;
 
-static struct timespec sim_start; //Keeps track of real time
+static struct event_base *eb = NULL; //Main event loop, which we use in a weird way
+static struct event *timeout_ev = NULL; //This is how we put a timeout on our event base
+
+static struct timeval sim_start; //Keeps track of real time
     
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
 
-static pthread_t gui_tid;
+//libevent event callbacks
+/*void timeout_cb(evutil_socket_t fd, short what, void *arg) {
+    struct event_base *base = (struct event_base *) arg;
+    event_base_dump_events(base, stdout);
+    event_base_loopbreak(base);
+    event_base_dump_events(base, stdout);
+    puts("\n\n\n");
+}*/
 
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
     free(f);
     
-    vpi_printf("\nQuitting...\n");
+    #ifdef _WIN32
+	WSACleanup();
+	#endif
     
-    pthread_join(gui_tid, NULL);
+    vpi_printf("\nQuitting...\n");
     
     return 0;
 }
@@ -59,18 +92,22 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
 static int start_of_sim(s_cb_data *dat) {
     vpi_printf("Time scaling: %g sim seconds per real-time second\n\n\n", 1.0f/TIME_SCALE);
     
-    clock_gettime(CLOCK_MONOTONIC, &sim_start);
+    //evutil_gettimeofday(&sim_start, NULL);
+    gettimeofday(&sim_start, NULL);
     
-    //VERY SUBTLE: you need to set the attribute for pthread condition
-    //variables to match the clock you're using
-    //Code adapted from https://stackoverflow.com/a/14397906/2737696
-    pthread_condattr_t attr;
-    pthread_condattr_init(&attr);
-    pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
-    pthread_cond_init(&inputs.cond, &attr);
+    #ifdef _WIN32
+	//Windows is such a thorn in my side...
+	WSADATA wsa_data;
+	WSAStartup(0x0202, &wsa_data);
+	#endif
     
-    //Fire up the GUI
-    pthread_create(&gui_tid, NULL, start_gtk, NULL);
+    //eb = event_base_new();
+    
+    //struct event *test_ev = event_new(eb, -1, EV_TIMEOUT, timeout_cb, eb);
+    //struct timeval superlong = {1245423, 3546234};
+    //event_add(test_ev, &superlong);
+    
+    //timeout_ev = event_new(eb, -1, EV_TIMEOUT, timeout_cb, eb);
     
     return 0;
 }
@@ -117,92 +154,34 @@ static int rw_sync(s_cb_data *dat) {
     //Check for keypresses until it's time to update the display
     while (1) {
         //Get current time and compare with scaled sim time
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
+        struct timeval now;
+        //evutil_gettimeofday(&now, NULL);        
+        gettimeofday(&now, NULL);
         
         //TODO: make time scaling a run-time argument
         double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
-                            + 1e-9 * (double) (now.tv_nsec - sim_start.tv_nsec));
+                            + 1e-6 * (double) (now.tv_usec - sim_start.tv_usec));
         double sim_time_ns = (double) dat->time->low / 1000.0;
         double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
         double disparity = (scaled_sim_time - real_time);
         
-        long end_nsec = now.tv_nsec + (long) (disparity * 1e9);
-        long end_sec = end_nsec/1000000000L;
-        end_nsec %= 1000000000L;
+        long disparity_usec = (long) (disparity * 1e6);
+        long disparity_sec = disparity_usec/1000000L;
+        disparity_usec %= 1000000L;
         
         //Subtle: pthread_cond_timedwait takes an absolute time, not a 
         //relative time
-        struct timespec abs_end_time = {
-            .tv_sec = now.tv_sec + end_sec,
-            .tv_nsec = end_nsec
+        struct timeval disparity_timeval = {
+            .tv_sec = disparity_sec,
+            .tv_usec = disparity_usec
         };
         
-        int nochange = 0;
-        int do_quit;
-        char sw_str[9];
-        sw_str[8] = 0;
+        //event_add(timeout_ev, &disparity_timeval);
         
-        pthread_mutex_lock(&inputs.mutex);
-        while (!inputs.changed) {
-            int rc;
-            if (disparity < 5e-3) {
-                //Don't bother waiting if the time is less than 5 ms
-                rc = ETIMEDOUT;
-            } else {
-                //Wait on the condition variable for a maximum amount of time
-                rc = pthread_cond_timedwait(&inputs.cond, &inputs.mutex, &abs_end_time);
-            }
-            
-            if (rc == ETIMEDOUT) {
-                //Remember that the simulation is halted as long as we're in
-                //this while loop. If waiting for the condition variable timed
-                //out, we should allow the simulation to continue. For example,
-                //the design might have a clock in it.
-                nochange = 1;
-                break;
-            } else if (rc != 0) {
-                perror("Could not issue timed wait");
-                do_quit = 1;
-                break;
-            }
-            
-            //Make local copies (for thread safety)
-            do_quit = inputs.quit_sim;
-            int i;
-            for (i = 0; i < 8; i++) {
-                sw_str[i] = inputs.switch_states[i] ? '1' : '0';
-                //For now, update button_vals inside the fake_fpga struct.
-                //But soon that will all go away
-                f->button_vals[i] = sw_str[i];
-            }
-        }
-        //Mark that we noticed the inputs changed
-        inputs.changed = 0;
-        pthread_mutex_unlock(&inputs.mutex);
+        //event_base_loop(eb, EVLOOP_ONCE);
         
-        if (nochange) {
-            //Allow simulation to continue
-            break;
-        } else if (do_quit) {
-            //Disable keep-alive callback (though I don't think this is
-            //actually necessary; vpiFinish should do the trick
-            vpi_remove_cb(f->keep_alive_cb_handle);
-            
-            //End sim
-            vpi_control(vpiFinish, 0);
-            return 0;
-        } else {
-            //Button input            
-            s_vpi_value sw_vals = {
-                .format = vpiBinStrVal,
-                .value = {
-                    sw_str
-                }
-            };
-            
-            vpi_put_value(f->buttons, &sw_vals, NULL, vpiNoDelay);
-        }
+        usleep(1000000*disparity_sec + disparity_usec);
+        
         break;
     }
     
@@ -262,7 +241,7 @@ static int value_change(s_cb_data *dat) {
     
     //Update the LED value string
     strncpy(f->led_new_val, dat->value->value.str, 8);
-    update_LEDs(dat->value->value.str);
+    //update_LEDs(dat->value->value.str);
     
     //Register fake I/O update callback
     reg_rw_sync_cb(f);
