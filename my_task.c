@@ -9,38 +9,97 @@
 #include <vpi_user.h>
 //#include <event2/event.h>
 #ifdef _WIN32
-#include <winsock2.h>
+    #include <winsock2.h>
+    typedef SOCKET sockfd;
+    
+    //The things windows and MinGW make me do...
+    //https://virtuallyfun.com/wordpress/2017/02/11/wsapoll-mingw/
+    #ifdef __MINGW32__
+        typedef struct pollfd {
+            SOCKET fd;
+            SHORT events;
+            SHORT revents;
+        } WSAPOLLFD, *PWSAPOLLFD, FAR *LPWSAPOLLFD;
+        WINSOCK_API_LINKAGE int WSAAPI WSAPoll(LPWSAPOLLFD fdArray, ULONG fds, INT timeout);
+        
+        /* Event flag definitions for WSAPoll(). */
+        #define POLLRDNORM  0x0100
+        #define POLLRDBAND  0x0200
+        #define POLLIN      (POLLRDNORM | POLLRDBAND)
+        #define POLLPRI     0x0400
+
+        #define POLLWRNORM  0x0010
+        #define POLLOUT     (POLLWRNORM)
+        #define POLLWRBAND  0x0020
+
+        #define POLLERR     0x0001
+        #define POLLHUP     0x0002
+        #define POLLNVAL    0x0004
+    #endif
+    
+    #define poll(x,y,z) WSAPoll(x,y,z)
+    #define fix_rc(x) (((x) == INVALID_SOCKET) ? WSAGetLastError() : 0)
+    #define sockerrno WSAGetLastError()
+    #define sockstrerror(x) int_to_str(x)
+    static char* int_to_str(int x) {
+        static char line[80];
+        sprintf(line, "some inscrutable windows-related problem with code %d", x);
+        return line;
+    }
 #else
-#include <sys/socket.h>
+    #include <sys/socket.h>
+    #include <poll.h>
+    typedef struct pollfd pollfd;
+    typedef int sockfd;
+    #define INVALID_SOCKET -1
+    #define closesocket(x) close(x)
+    #define fix_rc(x) (x)
+    #define sockerrno errno
+    #define sockstrerror(x) strerror(x)
 #endif
 
 #ifdef _WIN32
-//From https://stackoverflow.com/a/26085827/2737696
+    //From https://stackoverflow.com/a/26085827/2737696
 
-#include <stdint.h> // portable: uint64_t   MSVC: __int64 
+    #include <stdint.h> // portable: uint64_t   MSVC: __int64 
 
-int gettimeofday(struct timeval * tp, struct timezone * tzp)
-{
-    // Note: some broken versions only have 8 trailing zero's, the correct epoch has 9 trailing zero's
-    // This magic number is the number of 100 nanosecond intervals since January 1, 1601 (UTC)
-    // until 00:00:00 January 1, 1970 
-    static const uint64_t EPOCH = ((uint64_t) 116444736000000000ULL);
+    struct timezone;
 
-    SYSTEMTIME  system_time;
-    FILETIME    file_time;
-    uint64_t    time;
+    int gettimeofday(struct timeval * tp, struct timezone * tzp)
+    {
+        // Note: some broken versions only have 8 trailing zero's, the correct epoch has 9 trailing zero's
+        // This magic number is the number of 100 nanosecond intervals since January 1, 1601 (UTC)
+        // until 00:00:00 January 1, 1970 
+        static const uint64_t EPOCH = ((uint64_t) 116444736000000000ULL);
 
-    GetSystemTime( &system_time );
-    SystemTimeToFileTime( &system_time, &file_time );
-    time =  ((uint64_t)file_time.dwLowDateTime )      ;
-    time += ((uint64_t)file_time.dwHighDateTime) << 32;
+        SYSTEMTIME  system_time;
+        FILETIME    file_time;
+        uint64_t    time;
+        
+        GetSystemTime( &system_time );
+        SystemTimeToFileTime( &system_time, &file_time );
+        time =  ((uint64_t)file_time.dwLowDateTime )      ;
+        time += ((uint64_t)file_time.dwHighDateTime) << 32;
 
-    tp->tv_sec  = (long) ((time - EPOCH) / 10000000L);
-    tp->tv_usec = (long) (system_time.wMilliseconds * 1000);
-    return 0;
-}
-
+        tp->tv_sec  = (long) ((time - EPOCH) / 10000000L);
+        tp->tv_usec = (long) (system_time.wMilliseconds * 1000);
+        
+        return 0;
+    }
 #endif
+
+// At this point, the following API can be used on either Linux or Windows:
+// - poll can be used as normal, except for some subtle bug ms won't fix
+//   (see https://curl.haxx.se/mail/lib-2012-10/0038.html). I'm just hoping
+//   that I won't run into this
+// - save socket file descriptors into sockfd variables
+// - Use closesocket() instead of close()
+// - Use INVALID_SOCKET instead of -1
+// - gettimeofday can be used as normal
+// - (ugh) need to wrap all calls with fix_rc() because the winsock versions
+//   return INVALID_SOCKET rather than a meaningful error code
+// - Use sockerrno instead of errno
+// - Use sockstrerr(x) instead of strerror(x)
 
 #define TIME_SCALE (1.0/5e-9) //realtime seconds per simulation seconds
 
@@ -59,11 +118,13 @@ typedef struct _fake_fpga {
     
 } fake_fpga;
 
-static struct event_base *eb = NULL; //Main event loop, which we use in a weird way
-static struct event *timeout_ev = NULL; //This is how we put a timeout on our event base
+//static struct event_base *eb = NULL; //Main event loop, which we use in a weird way
+//static struct event *timeout_ev = NULL; //This is how we put a timeout on our event base
 
 static struct timeval sim_start; //Keeps track of real time
-    
+
+static sockfd client = INVALID_SOCKET;
+
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
 
 //libevent event callbacks
@@ -80,6 +141,10 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
     free(f);
     
+    if (client != INVALID_SOCKET) {
+        closesocket(client);
+    }
+    
     #ifdef _WIN32
 	WSACleanup();
 	#endif
@@ -92,8 +157,6 @@ static int end_of_sim_cleanup(s_cb_data *dat) {
 static int start_of_sim(s_cb_data *dat) {
     vpi_printf("Time scaling: %g sim seconds per real-time second\n\n\n", 1.0f/TIME_SCALE);
     
-    //evutil_gettimeofday(&sim_start, NULL);
-    gettimeofday(&sim_start, NULL);
     
     #ifdef _WIN32
 	//Windows is such a thorn in my side...
@@ -109,6 +172,51 @@ static int start_of_sim(s_cb_data *dat) {
     
     //timeout_ev = event_new(eb, -1, EV_TIMEOUT, timeout_cb, eb);
     
+    sockfd server = socket(AF_INET, SOCK_STREAM, 0);
+    
+    if (server == INVALID_SOCKET) {
+        vpi_printf("Could not open socket: %s\n", sockstrerror(sockerrno));
+        vpi_control(vpiFinish, 1);
+        return 0;
+    }
+    
+    struct sockaddr_in local = {
+        .sin_family = AF_INET,
+        .sin_port = htons(5555)
+    };
+    
+    int rc = fix_rc(bind(server, (struct sockaddr*) &local, sizeof(struct sockaddr_in)));
+    if (rc < 0) {
+        vpi_printf("Could not bind to port 5555: %s\n", sockstrerror(rc));
+        vpi_control(vpiFinish, 1);
+        return 0;
+    }
+    
+    rc = fix_rc(listen(server, 1));
+    if (rc < 0) {
+        vpi_printf("Could not start listening: %s\n", sockstrerror(rc));
+        vpi_control(vpiFinish, 1);
+        return 0;
+    }
+    
+    vpi_printf("Listening for incoming connections...\n");
+    vpi_mcd_flush(1);
+    
+    client = accept(server, NULL, NULL);
+    
+    if (client == INVALID_SOCKET) {
+        vpi_printf("Could not accept incoming connection: %s\n", sockstrerror(sockerrno));
+        vpi_control(vpiFinish, 1);
+        return 0;
+    }
+    
+    vpi_printf("Client has connected!\n");
+    
+    closesocket(server);
+    
+    //evutil_gettimeofday(&sim_start, NULL);
+    gettimeofday(&sim_start, NULL);
+    
     return 0;
 }
 
@@ -122,8 +230,10 @@ char *led_disp(char const *binstr) {
     for (i = 0; i < 8; i++) {
         int incr;
         int on = (binstr[i] == '1');
-        sprintf(p, "%s  \e[49m %n", on ? "\e[41m" : "\e[44m", &incr);
-        p += incr;
+        //sprintf(p, "%s  \e[49m %n", on ? "\e[41m" : "\e[44m", &incr);
+        sprintf(p, "%s %n", on ? "ON" : "OF", &incr);
+        //p += incr;
+        p += 3;
     }
     
     return ret;
@@ -139,7 +249,9 @@ char *button_disp(char const *binstr) {
         int incr;
         int on = (binstr[i] == '1');
         sprintf(p, "%s %n", on ? "^^" : "vv", &incr);
-        p += incr;
+        //sprintf is broken on windows!!! wtf!!!
+        //p += incr;
+        p += 3;
     }
     
     return ret;
@@ -151,38 +263,71 @@ static int rw_sync(s_cb_data *dat) {
     //Grab FPGA state from callback user data
     fake_fpga *f = (fake_fpga*) dat->user_data;    
     
-    //Check for keypresses until it's time to update the display
-    while (1) {
-        //Get current time and compare with scaled sim time
-        struct timeval now;
-        //evutil_gettimeofday(&now, NULL);        
-        gettimeofday(&now, NULL);
-        
-        //TODO: make time scaling a run-time argument
-        double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
-                            + 1e-6 * (double) (now.tv_usec - sim_start.tv_usec));
-        double sim_time_ns = (double) dat->time->low / 1000.0;
-        double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
-        double disparity = (scaled_sim_time - real_time);
-        
-        long disparity_usec = (long) (disparity * 1e6);
-        long disparity_sec = disparity_usec/1000000L;
-        disparity_usec %= 1000000L;
-        
-        //Subtle: pthread_cond_timedwait takes an absolute time, not a 
-        //relative time
-        struct timeval disparity_timeval = {
-            .tv_sec = disparity_sec,
-            .tv_usec = disparity_usec
-        };
-        
-        //event_add(timeout_ev, &disparity_timeval);
-        
-        //event_base_loop(eb, EVLOOP_ONCE);
-        
-        usleep(1000000*disparity_sec + disparity_usec);
-        
-        break;
+    //Get current time and compare with scaled sim time
+    struct timeval now;
+    //evutil_gettimeofday(&now, NULL);        
+    gettimeofday(&now, NULL);
+    
+    //TODO: make time scaling a run-time argument
+    double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
+                        + 1e-6 * (double) (now.tv_usec - sim_start.tv_usec));
+    double sim_time_ns = (double) dat->time->low / 1000.0;
+    double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
+    double disparity = (scaled_sim_time - real_time);
+    
+    /*
+    long disparity_usec = (long) (disparity * 1e6);
+    long disparity_sec = disparity_usec/1000000L;
+    disparity_usec %= 1000000L;
+    
+    
+    struct timeval disparity_timeval = {
+        .tv_sec = disparity_sec,
+        .tv_usec = disparity_usec
+    };
+    
+    event_add(timeout_ev, &disparity_timeval);
+    
+    event_base_loop(eb, EVLOOP_ONCE);
+    */
+    int disparity_ms = disparity * 1e3;
+    
+    //Don't actually wait if the waiting time is less than 5 ms
+    if (disparity_ms < 5) disparity_ms = 0;
+    
+    struct pollfd pfd = {
+        .fd = client,
+        .events = POLLIN
+    };
+    
+    int rc = poll(&pfd, 1, disparity_ms);
+    if (rc < 0) {
+        vpi_printf("poll() got some kind of error: %s", sockstrerror(sockerrno));
+        vpi_mcd_flush(1);
+        vpi_control(vpiFinish, 1);
+        return 0;
+    } else if (rc > 0) {
+        //vpi_printf("Got network data! Draining it...\n");
+        char ignore[512];
+        int rc = recv(client, ignore, sizeof(ignore), 0);
+        if (rc < 0) {
+            vpi_printf("Could not read network data: %s", sockstrerror(sockerrno));
+            vpi_mcd_flush(1);
+            vpi_control(vpiFinish, 1);
+            return 0;
+        }
+        if ('1' <= ignore[0] && ignore[0] <= '8') {
+            f->button_vals[ignore[0] - '1'] ^= 1;
+            s_vpi_value new_vals = {
+                .format = vpiBinStrVal,
+                .value = {f->button_vals}
+            };
+            
+            vpi_put_value(f->buttons, &new_vals, NULL, vpiNoDelay);
+        } else if (ignore[0] == 'q') {
+            vpi_control(vpiFinish, 1);
+            return 0;
+        }
     }
     
     //Time+value info
@@ -195,7 +340,6 @@ static int rw_sync(s_cb_data *dat) {
     
     //Mark that we've finished the callback
     f->ledrd_cb_reg = 0;
-    
     
     return 0;
 }
