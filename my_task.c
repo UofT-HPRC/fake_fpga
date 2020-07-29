@@ -48,6 +48,8 @@
     }
 #else
     #include <sys/socket.h>
+	#include <netinet/in.h>
+	#include <sys/time.h>
     #include <poll.h>
     typedef struct pollfd pollfd;
     typedef int sockfd;
