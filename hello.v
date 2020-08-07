@@ -21,8 +21,8 @@ module main;
     reg [7:0] leds = 0;
     wire [7:0] buttons;
 
-    always #5 leds[0] <= ~leds[0];
-    //always @(*) leds[0] <= buttons[0];
+    //always #5 leds[0] <= ~leds[0];
+    always @(*) leds[0] <= buttons[0];
     
     genvar i;
     generate for(i = 1; i < 8; i = i + 1) begin

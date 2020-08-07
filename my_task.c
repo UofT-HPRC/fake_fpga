@@ -7,9 +7,35 @@
 #include <unistd.h>
 #include <errno.h>
 #include <vpi_user.h>
-//#include <event2/event.h>
 #ifdef _WIN32
     #include <winsock2.h>
+    #include <Ws2tcpip.h>
+    
+    //From https://stackoverflow.com/a/20816961/2737696
+	int inet_pton(int af, const char *src, void *dst)
+	{
+	  struct sockaddr_storage ss;
+	  int size = sizeof(ss);
+	  char src_copy[INET6_ADDRSTRLEN+1];
+
+	  ZeroMemory(&ss, sizeof(ss));
+	  /* stupid non-const API */
+	  strncpy (src_copy, src, INET6_ADDRSTRLEN+1);
+	  src_copy[INET6_ADDRSTRLEN] = 0;
+
+	  if (WSAStringToAddress(src_copy, af, NULL, (struct sockaddr *)&ss, &size) == 0) {
+		switch(af) {
+		  case AF_INET:
+		*(struct in_addr *)dst = ((struct sockaddr_in *)&ss)->sin_addr;
+		return 1;
+		  case AF_INET6:
+		*(struct in6_addr *)dst = ((struct sockaddr_in6 *)&ss)->sin6_addr;
+		return 1;
+		}
+	  }
+	  return 0;
+	}
+    
     typedef SOCKET sockfd;
     
     //The things windows and MinGW make me do...
@@ -99,7 +125,9 @@
 // - Use INVALID_SOCKET instead of -1
 // - gettimeofday can be used as normal
 // - (ugh) need to wrap all calls with fix_rc() because the winsock versions
-//   return INVALID_SOCKET rather than a meaningful error code
+//   return INVALID_SOCKET rather than a meaningful error code. By the way,
+//	 0 means success and anything else is an error number that can be passed
+//	 into sockstrerror()
 // - Use sockerrno instead of errno
 // - Use sockstrerr(x) instead of strerror(x)
 
@@ -109,42 +137,30 @@ typedef struct _fake_fpga {
     vpiHandle buttons, leds; //Handles to the button and LED nets
     int vc_cb_reg; //Nonzero if LED value change callback already registered
     
-    char led_new_val[9]; //String containing latest LED values, or NULL if nothing changed 
+    char led_new_val[9]; //String containing latest LED values, or NULs if nothing changed 
                          //Extra byte is for NUL character
     int ledrd_cb_reg; //Nonzero if ReadOnlySynch callback registered for printing led values
     
     char button_vals[9]; //Keep track of button states for displaying
     
     vpiHandle keep_alive_cb_handle; //We need to cancel keep_alive callbacks
-    //when the simulation ends
+                                    //when the simulation ends
     
 } fake_fpga;
 
-//static struct event_base *eb = NULL; //Main event loop, which we use in a weird way
-//static struct event *timeout_ev = NULL; //This is how we put a timeout on our event base
-
 static struct timeval sim_start; //Keeps track of real time
 
-static sockfd client = INVALID_SOCKET;
+static sockfd server = INVALID_SOCKET;
 
 #define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
-
-//libevent event callbacks
-/*void timeout_cb(evutil_socket_t fd, short what, void *arg) {
-    struct event_base *base = (struct event_base *) arg;
-    event_base_dump_events(base, stdout);
-    event_base_loopbreak(base);
-    event_base_dump_events(base, stdout);
-    puts("\n\n\n");
-}*/
 
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
     fake_fpga *f = (fake_fpga*) dat->user_data;
     free(f);
     
-    if (client != INVALID_SOCKET) {
-        closesocket(client);
+    if (server != INVALID_SOCKET) {
+        closesocket(server);
     }
     
     #ifdef _WIN32
@@ -166,13 +182,10 @@ static int start_of_sim(s_cb_data *dat) {
 	WSAStartup(0x0202, &wsa_data);
 	#endif
     
-    //eb = event_base_new();
-    
-    //struct event *test_ev = event_new(eb, -1, EV_TIMEOUT, timeout_cb, eb);
-    //struct timeval superlong = {1245423, 3546234};
-    //event_add(test_ev, &superlong);
-    
-    //timeout_ev = event_new(eb, -1, EV_TIMEOUT, timeout_cb, eb);
+    /*
+     
+    // This is if the simulation is the server, but this code is commented
+    // out because Ruiqi's GUI is a server instead
     
     sockfd server = socket(AF_INET, SOCK_STREAM, 0);
     
@@ -205,16 +218,33 @@ static int start_of_sim(s_cb_data *dat) {
     vpi_mcd_flush(1);
     
     client = accept(server, NULL, NULL);
+    */
     
-    if (client == INVALID_SOCKET) {
-        vpi_printf("Could not accept incoming connection: %s\n", sockstrerror(sockerrno));
+    server = socket(AF_INET, SOCK_STREAM, 0);
+    
+    if (server == INVALID_SOCKET) {
+        vpi_printf("Could not open socket: %s\n", sockstrerror(sockerrno));
         vpi_control(vpiFinish, 1);
         return 0;
     }
     
-    vpi_printf("Client has connected!\n");
+    struct sockaddr_in serv_addr = {
+        .sin_family = AF_INET,
+        .sin_port = htons(54321)
+    };
     
-    closesocket(server);
+    inet_pton(AF_INET, "127.0.0.1", &(serv_addr.sin_addr));
+    
+    int rc = fix_rc(connect(server, (struct sockaddr*) &serv_addr, sizeof(struct sockaddr_in)));
+    
+    if (rc != 0) {
+        vpi_printf("Could not connect to GUI server: %s\n", sockstrerror(rc));
+        vpi_control(vpiFinish, 1);
+        return 0;
+	}
+    
+    vpi_printf("Connected to server!\n");
+    vpi_mcd_flush(1);
     
     //evutil_gettimeofday(&sim_start, NULL);
     gettimeofday(&sim_start, NULL);
@@ -251,7 +281,7 @@ char *button_disp(char const *binstr) {
         int incr;
         int on = (binstr[i] == '1');
         sprintf(p, "%s %n", on ? "^^" : "vv", &incr);
-        //sprintf is broken on windows!!! wtf!!!
+        //sprintf's %n is broken on windows!!! wtf!!!
         //p += incr;
         p += 3;
     }
@@ -263,7 +293,10 @@ char *button_disp(char const *binstr) {
 //button presses
 static int rw_sync(s_cb_data *dat) {
     //Grab FPGA state from callback user data
-    fake_fpga *f = (fake_fpga*) dat->user_data;    
+    fake_fpga *f = (fake_fpga*) dat->user_data;   
+     
+    //Mark that we've received the callback
+    f->ledrd_cb_reg = 0;
     
     //Get current time and compare with scaled sim time
     struct timeval now;
@@ -277,28 +310,14 @@ static int rw_sync(s_cb_data *dat) {
     double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
     double disparity = (scaled_sim_time - real_time);
     
-    /*
-    long disparity_usec = (long) (disparity * 1e6);
-    long disparity_sec = disparity_usec/1000000L;
-    disparity_usec %= 1000000L;
-    
-    
-    struct timeval disparity_timeval = {
-        .tv_sec = disparity_sec,
-        .tv_usec = disparity_usec
-    };
-    
-    event_add(timeout_ev, &disparity_timeval);
-    
-    event_base_loop(eb, EVLOOP_ONCE);
-    */
-    int disparity_ms = disparity * 1e3;
+    //int disparity_ms = disparity * 1e3;
+    int disparity_ms = 1000;
     
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
     
     struct pollfd pfd = {
-        .fd = client,
+        .fd = server,
         .events = POLLIN
     };
     
@@ -310,38 +329,74 @@ static int rw_sync(s_cb_data *dat) {
         return 0;
     } else if (rc > 0) {
         //vpi_printf("Got network data! Draining it...\n");
-        char ignore[512];
-        int rc = recv(client, ignore, sizeof(ignore), 0);
+        char msg[80];
+        int rc = recv(server, msg, sizeof(msg) - 1, 0);
         if (rc < 0) {
             vpi_printf("Could not read network data: %s", sockstrerror(sockerrno));
             vpi_mcd_flush(1);
             vpi_control(vpiFinish, 1);
             return 0;
         }
-        if ('1' <= ignore[0] && ignore[0] <= '8') {
-            f->button_vals[ignore[0] - '1'] ^= 1;
-            s_vpi_value new_vals = {
-                .format = vpiBinStrVal,
-                .value = {f->button_vals}
-            };
-            
-            vpi_put_value(f->buttons, &new_vals, NULL, vpiNoDelay);
-        } else if (ignore[0] == 'q') {
-            vpi_control(vpiFinish, 1);
-            return 0;
-        }
+        msg[rc] = 0; //NUL-terminate just to cover edge cases
+        
+        vpi_printf("Received [%s]\n", msg);
+        vpi_mcd_flush(1);
+        
+        char *boundary = strpbrk(msg, " \t\n\v");
+        if (boundary) *boundary++ = 0;
+        
+        if(!strcmp(msg, "SW")) {
+			if (!boundary) {
+				vpi_printf("Warning: malformed switch command. Ignoring...\n");
+				vpi_mcd_flush(1);
+				goto update_outputs;
+			}
+			
+			int swnum, val;
+			int rc = sscanf(boundary, "%d %d", &swnum, &val);
+			if (rc < 2 || swnum < 0 || swnum > 7) {
+				vpi_printf("Warning: malformed switch command. Ignoring...\n");
+				vpi_mcd_flush(1);
+				goto update_outputs;
+			}
+			
+			swnum = 7 - swnum;
+			
+			vpi_printf("Setting button %d to %d\n", swnum, val);
+			vpi_mcd_flush(1);
+			
+			f->button_vals[swnum] = (val) ? '1' : '0';
+			
+			s_vpi_value new_vals = {
+				.format = vpiBinStrVal,
+				.value = {f->button_vals}
+			};
+			
+			vpi_put_value(f->buttons, &new_vals, NULL, vpiNoDelay);
+		} else if (!strcmp(msg, "end\r\n")) {
+			vpi_control(vpiFinish, 1);
+			return 0;
+		} else {
+			vpi_printf("Unrecognized command: [%s]. Ignoring...\n", msg);
+			vpi_mcd_flush(1);
+		}
     }
     
-    //Time+value info
-    vpi_printf("\e[2A\r%s, time = %u        \n%s\n 1  2  3  4  5  6  7  8", 
-        led_disp(f->led_new_val), 
-        dat->time->low, 
-        button_disp(f->button_vals)
-    );
-    vpi_mcd_flush(1);
+    update_outputs:
     
-    //Mark that we've finished the callback
-    f->ledrd_cb_reg = 0;
+    //Check if LED values have changed
+    if (f->led_new_val[0] != 0) {
+		char line[13];
+		//%n in sprintf is broken on MinGW!!!! Why????
+		sprintf(line, "l00%s\n", f->led_new_val);
+		
+		//Use a regular blocking send on the socket. If internet is slow,
+		//it makes sense that the simulation should also slow down
+		send(server, line, 12, 0);
+		
+		//Mark that we've seen the updated values
+		f->led_new_val[0] = 0;
+	}
     
     return 0;
 }
@@ -387,7 +442,7 @@ static int value_change(s_cb_data *dat) {
     
     //Update the LED value string
     strncpy(f->led_new_val, dat->value->value.str, 8);
-    //update_LEDs(dat->value->value.str);
+    f->led_new_val[8] = 0;
     
     //Register fake I/O update callback
     reg_rw_sync_cb(f);
