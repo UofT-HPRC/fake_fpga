@@ -75,6 +75,7 @@
 #else
     #include <sys/socket.h>
 	#include <netinet/in.h>
+	#include <arpa/inet.h>
 	#include <sys/time.h>
     #include <poll.h>
     typedef struct pollfd pollfd;
@@ -298,9 +299,22 @@ static int rw_sync(s_cb_data *dat) {
     //Mark that we've received the callback
     f->ledrd_cb_reg = 0;
     
+    //Check if LED values have changed
+    if (f->led_new_val[0] != 0) {
+		char line[13];
+		//%n in sprintf is broken on MinGW!!!! Why????
+		sprintf(line, "l00%s\n", f->led_new_val);
+		
+		//Use a regular blocking send on the socket. If internet is slow,
+		//it makes sense that the simulation should also slow down
+		send(server, line, 12, 0);
+		
+		//Mark that we've seen the updated values
+		f->led_new_val[0] = 0;
+	}
+    
     //Get current time and compare with scaled sim time
-    struct timeval now;
-    //evutil_gettimeofday(&now, NULL);        
+    struct timeval now;    
     gettimeofday(&now, NULL);
     
     //TODO: make time scaling a run-time argument
@@ -310,8 +324,7 @@ static int rw_sync(s_cb_data *dat) {
     double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
     double disparity = (scaled_sim_time - real_time);
     
-    //int disparity_ms = disparity * 1e3;
-    int disparity_ms = 1000;
+    int disparity_ms = disparity * 1e3;
     
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
@@ -339,17 +352,14 @@ static int rw_sync(s_cb_data *dat) {
         }
         msg[rc] = 0; //NUL-terminate just to cover edge cases
         
-        vpi_printf("Received [%s]\n", msg);
-        vpi_mcd_flush(1);
-        
-        char *boundary = strpbrk(msg, " \t\n\v");
+        char *boundary = strpbrk(msg, " \t\r\n\v");
         if (boundary) *boundary++ = 0;
         
         if(!strcmp(msg, "SW")) {
 			if (!boundary) {
 				vpi_printf("Warning: malformed switch command. Ignoring...\n");
 				vpi_mcd_flush(1);
-				goto update_outputs;
+				return 0;
 			}
 			
 			int swnum, val;
@@ -357,12 +367,11 @@ static int rw_sync(s_cb_data *dat) {
 			if (rc < 2 || swnum < 0 || swnum > 7) {
 				vpi_printf("Warning: malformed switch command. Ignoring...\n");
 				vpi_mcd_flush(1);
-				goto update_outputs;
+				return 0;
 			}
 			
 			swnum = 7 - swnum;
 			
-			vpi_printf("Setting button %d to %d\n", swnum, val);
 			vpi_mcd_flush(1);
 			
 			f->button_vals[swnum] = (val) ? '1' : '0';
@@ -373,7 +382,7 @@ static int rw_sync(s_cb_data *dat) {
 			};
 			
 			vpi_put_value(f->buttons, &new_vals, NULL, vpiNoDelay);
-		} else if (!strcmp(msg, "end\r\n")) {
+		} else if (!strcmp(msg, "end")) {
 			vpi_control(vpiFinish, 1);
 			return 0;
 		} else {
@@ -381,22 +390,6 @@ static int rw_sync(s_cb_data *dat) {
 			vpi_mcd_flush(1);
 		}
     }
-    
-    update_outputs:
-    
-    //Check if LED values have changed
-    if (f->led_new_val[0] != 0) {
-		char line[13];
-		//%n in sprintf is broken on MinGW!!!! Why????
-		sprintf(line, "l00%s\n", f->led_new_val);
-		
-		//Use a regular blocking send on the socket. If internet is slow,
-		//it makes sense that the simulation should also slow down
-		send(server, line, 12, 0);
-		
-		//Mark that we've seen the updated values
-		f->led_new_val[0] = 0;
-	}
     
     return 0;
 }
