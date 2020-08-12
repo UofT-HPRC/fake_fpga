@@ -27,6 +27,12 @@ run: tb.vvp my_task.vpi
 debug: hello.vvp my_task.vpi
 	gdb --args vvp -M. -mmy_task hello.vvp
 
+fakefpga.o: my_task.c
+	gcc -Wall -g -c -fno-diagnostics-show-caret -fpic -Iinclude -o fakefpga.o my_task.c 
+
+fakefpga.vpi: fakefpga.o
+	gcc -Wall -g -shared -o fakefgpa.vpi fakefpga.o -Llib -lmtipli -lws2_32
+
 clean:
 	rm -rf *.o
 	rm -rf *.vpi

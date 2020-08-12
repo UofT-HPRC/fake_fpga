@@ -18,7 +18,7 @@ wire [2:0] colour;       // VGA pixel colour (0-7)
 wire plot;               // Pixel drawn when this is pulsed
 wire vga_resetn;         // VGA reset to black when this is pulsed
 
-initial $my_task(CLOCK_50, SW, KEY, LED, HEX, x, y, colour, plot, vga_resetn);
+initial $fake_fpga(CLOCK_50, SW, KEY, LED, HEX, x, y, colour, plot, vga_resetn);
 
 //Easiest way to generate the clock is in the verilog rather than in the VPI
 //As promised, this simulates a 50 MHz clock.

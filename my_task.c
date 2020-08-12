@@ -141,7 +141,7 @@
 // - Use sockstrerr(x) instead of strerror(x)
 */
 
-#define TIME_SCALE (1.0/20e-3) //realtime seconds per simulation seconds
+#define TIME_SCALE (1.0/200e-6) //realtime seconds per simulation seconds
 
 #define NUM_KEYS 4
 
@@ -331,8 +331,8 @@ static int rw_sync(s_cb_data *dat) {
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
     
-    //vpi_printf("Waiting for %d ms\n", disparity_ms);
-    //vpi_mcd_flush(1);
+    vpi_printf("Waiting for %d ms (disparity = %g ms)\n", disparity_ms, disparity * 1e3);
+    vpi_mcd_flush(1);
     
     struct pollfd pfd = {
         .fd = server,
@@ -414,14 +414,11 @@ static int rw_sync(s_cb_data *dat) {
 			
 			keynum = (NUM_KEYS - 1) - keynum;
 			
-            vpi_printf("Setting KEY %d to %d\n", keynum, val);
+            //vpi_printf("Setting KEY %d to %d\n", keynum, val);
             
 			vpi_mcd_flush(1);
 			
 			f->key_vals[keynum] = (val) ? '1' : '0';
-            
-            //vpi_printf("button_vals is now [%s]\n", f->button_vals);
-            //vpi_mcd_flush(1);
 			
 			s_vpi_value new_vals = {
 				.format = vpiBinStrVal,
@@ -654,7 +651,7 @@ static int keep_alive(s_cb_data *dat) {
 static void reg_keep_alive_cb(fake_fpga *f) {
     s_vpi_time delay = {
         .type = vpiSimTime,
-        .low = 50000,
+        .low = 5000,
         .high = 0
     };
     
@@ -760,7 +757,7 @@ static int my_compiletf(char* user_data) {
     f->rwsync_cb_reg = 0;
     f->rosync_cb_reg = 0;
     strcpy(f->button_vals, "0000000000");
-    strcpy(f->key_vals, "0000");
+    strcpy(f->key_vals, "1111");
     
     //Attach the allocated FPGA state struct to this task call instance
     vpi_put_userdata(self, f);
@@ -834,7 +831,7 @@ static int my_calltf(char* user_data) {
 void my_task_register() {
     s_vpi_systf_data tf_data = {
         .type      = vpiSysTask,
-        .tfname    = "$my_task",
+        .tfname    = "$fake_fpga",
         .calltf    = my_calltf,
         .compiletf = my_compiletf,
         .user_data = 0
