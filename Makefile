@@ -18,8 +18,11 @@ my_task.vpi: my_task.o
 hello.vvp:	hello.v
 	iverilog -o hello.vvp hello.v
 
-run: hello.vvp my_task.vpi
-	vvp -M. -mmy_task hello.vvp
+tb.vvp:	tb.v hello.v
+	iverilog -o tb.vvp tb.v
+
+run: tb.vvp my_task.vpi
+	vvp -M. -mmy_task tb.vvp
 
 debug: hello.vvp my_task.vpi
 	gdb --args vvp -M. -mmy_task hello.vvp

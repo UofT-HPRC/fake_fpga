@@ -64,31 +64,26 @@
     #endif
     
     #define poll(x,y,z) WSAPoll(x,y,z)
-    #define fix_rc(x) (((x) == INVALID_SOCKET) ? WSAGetLastError() : 0)
+    //Windows really makes things complicated...
+    #define fix_rc(x) (((x) == SOCKET_ERROR) ? WSAGetLastError() : 0)
     #define sockerrno WSAGetLastError()
-    #define sockstrerror(x) int_to_str(x)
-    static char* int_to_str(int x) {
+    
+    static char* sockstrerror(int x) {
         static char line[80];
-        sprintf(line, "some inscrutable windows-related problem with code %d", x);
+        //It's unbelievable how the Window API is so overcomplicated!
+        //From https://stackoverflow.com/a/16723307/2737696
+        char *s = NULL;
+        FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, 
+                       NULL, x,
+                       MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+                       (LPSTR)&s, 0, NULL);
+        strcpy(line, s);
+        LocalFree(s);
+        
+        //sprintf(line, "some inscrutable windows-related problem with code %d", x);
         return line;
     }
-#else
-    #include <sys/socket.h>
-	#include <netinet/in.h>
-	#include <arpa/inet.h>
-	#include <sys/time.h>
-    #include <poll.h>
-    typedef struct pollfd pollfd;
-    typedef int sockfd;
-    #define INVALID_SOCKET -1
-    #define closesocket(x) close(x)
-    #define fix_rc(x) (x)
-    #define sockerrno errno
-    #define sockstrerror(x) strerror(x)
-#endif
-
-#ifdef _WIN32
-    //From https://stackoverflow.com/a/26085827/2737696
+        //From https://stackoverflow.com/a/26085827/2737696
 
     #include <stdint.h> // portable: uint64_t   MSVC: __int64 
 
@@ -115,9 +110,22 @@
         
         return 0;
     }
+    
+#else
+    #include <sys/socket.h>
+	#include <netinet/in.h>
+	#include <arpa/inet.h>
+	#include <sys/time.h>
+    #include <poll.h>
+    typedef struct pollfd pollfd;
+    typedef int sockfd;
+    #define INVALID_SOCKET -1
+    #define closesocket(x) close(x)
+    #define fix_rc(x) (x)
+    #define sockerrno errno
+    #define sockstrerror(x) strerror(x)
 #endif
-
-// At this point, the following API can be used on either Linux or Windows:
+/* At this point, the following API can be used on either Linux or Windows:
 // - poll can be used as normal, except for some subtle bug ms won't fix
 //   (see https://curl.haxx.se/mail/lib-2012-10/0038.html). I'm just hoping
 //   that I won't run into this
@@ -131,18 +139,32 @@
 //	 into sockstrerror()
 // - Use sockerrno instead of errno
 // - Use sockstrerr(x) instead of strerror(x)
+*/
 
-#define TIME_SCALE (1.0/5e-9) //realtime seconds per simulation seconds
+#define TIME_SCALE (1.0/20e-3) //realtime seconds per simulation seconds
+
+#define NUM_LEDS 10
+
+#define NUM_HEX_DISPLAYS 6
+
+#define HEX_NYBBLES (2*NUM_HEX_DISPLAYS)
 
 typedef struct _fake_fpga {
-    vpiHandle buttons, leds; //Handles to the button and LED nets
-    int vc_cb_reg; //Nonzero if LED value change callback already registered
+    vpiHandle clk, buttons, keys, leds, hex; //Handles to the regs/nets in the testbench
+    vpiHandle x, y, colour, plot, vga_resetn; //Nets specifically for VGA control
+    int led_vc_cb_reg; //Nonzero if LED value change callback already registered
+    int hex_vc_cb_reg; //Nonzero if HEX value change callback already registered
+    int clk_vc_cb_reg; //Nonzero if CLK value change callback already registered
     
-    char led_new_val[9]; //String containing latest LED values, or NULs if nothing changed 
-                         //Extra byte is for NUL character
-    int ledrd_cb_reg; //Nonzero if ReadOnlySynch callback registered for printing led values
+    int rwsync_cb_reg; //Nonzero if ReadWriteSynch callback is already registered
+    int rosync_cb_reg; //Nonzero if ReadOnlySynch callback is already registered
     
-    char button_vals[9]; //Keep track of button states for displaying
+    char led_new_val[NUM_LEDS + 1];    //String containing latest LED values, 
+                                       //or NULs if nothing changed .
+                                       //Extra byte is for NUL character
+    char hex_new_val[HEX_NYBBLES + 1]; //Same idea as LEDs but for HEX
+    
+    char button_vals[NUM_LEDS + 1]; //Keep track of button states for displaying
     
     vpiHandle keep_alive_cb_handle; //We need to cancel keep_alive callbacks
                                     //when the simulation ends
@@ -153,7 +175,8 @@ static struct timeval sim_start; //Keeps track of real time
 
 static sockfd server = INVALID_SOCKET;
 
-#define USAGE  "fake_fpga(leds[7:0], buttons[7:0]);"
+#define USAGE  "$my_task(reg clk, reg buttons[9:0], reg keys[9:0], wire leds[9:0], wire hex[47:0],\n" \
+                "        wire [7:0] x, wire [6:0] y, wire [2:0] colours, wire plot, wire vga_resetn);"
 
 //Frees all the fake_fpga instances
 static int end_of_sim_cleanup(s_cb_data *dat) {
@@ -253,64 +276,41 @@ static int start_of_sim(s_cb_data *dat) {
     return 0;
 }
 
-
-//Cheesy helper function to generate nice LED display string
-char *led_disp(char const *binstr) {
-    static char ret[160];
-    char *p = ret;
-    
-    int i;
-    for (i = 0; i < 8; i++) {
-        int incr;
-        int on = (binstr[i] == '1');
-        //sprintf(p, "%s  \e[49m %n", on ? "\e[41m" : "\e[44m", &incr);
-        sprintf(p, "%s %n", on ? "ON" : "OF", &incr);
-        //p += incr;
-        p += 3;
-    }
-    
-    return ret;
-}
-
-//Cheesy helper function to generate nice button display string
-char *button_disp(char const *binstr) {
-    static char ret[160];
-    char *p = ret;
-    
-    int i;
-    for (i = 0; i < 8; i++) {
-        int incr;
-        int on = (binstr[i] == '1');
-        sprintf(p, "%s %n", on ? "^^" : "vv", &incr);
-        //sprintf's %n is broken on windows!!! wtf!!!
-        //p += incr;
-        p += 3;
-    }
-    
-    return ret;
-}
-
-//Dumb ReadWriteSynch callback that prints fpga state values and checks for 
+//ReadWriteSynch callback that prints fpga state values and checks for 
 //button presses
 static int rw_sync(s_cb_data *dat) {
     //Grab FPGA state from callback user data
     fake_fpga *f = (fake_fpga*) dat->user_data;   
      
     //Mark that we've received the callback
-    f->ledrd_cb_reg = 0;
+    f->rwsync_cb_reg = 0;
     
     //Check if LED values have changed
     if (f->led_new_val[0] != 0) {
-		char line[13];
+		char line[NUM_LEDS + 2 + 1];
 		//%n in sprintf is broken on MinGW!!!! Why????
-		sprintf(line, "l00%s\n", f->led_new_val);
+		sprintf(line, "l%s\n", f->led_new_val);
 		
 		//Use a regular blocking send on the socket. If internet is slow,
 		//it makes sense that the simulation should also slow down
-		send(server, line, 12, 0);
+		send(server, line, NUM_LEDS + 2, 0);
 		
 		//Mark that we've seen the updated values
 		f->led_new_val[0] = 0;
+	}
+    
+    //Check if HEX values have changed
+    if (f->hex_new_val[0] != 0) {
+		char line[HEX_NYBBLES + 2 + 1];
+		//%n in sprintf is broken on MinGW!!!! Why????
+		sprintf(line, "h%s\n", f->hex_new_val);
+		
+		//Use a regular blocking send on the socket. If internet is slow,
+		//it makes sense that the simulation should also slow down
+		send(server, line, HEX_NYBBLES + 2, 0);
+		
+		//Mark that we've seen the updated values
+		f->hex_new_val[0] = 0;
 	}
     
     //Get current time and compare with scaled sim time
@@ -329,13 +329,16 @@ static int rw_sync(s_cb_data *dat) {
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
     
+    //vpi_printf("Waiting for %d ms\n", disparity_ms);
+    //vpi_mcd_flush(1);
+    
     struct pollfd pfd = {
         .fd = server,
         .events = POLLIN
     };
     
     int rc = poll(&pfd, 1, disparity_ms);
-    if (rc < 0) {
+    if (fix_rc(rc) != 0) {
         vpi_printf("poll() got some kind of error: %s", sockstrerror(sockerrno));
         vpi_mcd_flush(1);
         vpi_control(vpiFinish, 1);
@@ -346,6 +349,11 @@ static int rw_sync(s_cb_data *dat) {
         int rc = recv(server, msg, sizeof(msg) - 1, 0);
         if (rc < 0) {
             vpi_printf("Could not read network data: %s", sockstrerror(sockerrno));
+            vpi_mcd_flush(1);
+            vpi_control(vpiFinish, 1);
+            return 0;
+        } else if (rc == 0) {
+            vpi_printf("GUI has closed the connection\n");
             vpi_mcd_flush(1);
             vpi_control(vpiFinish, 1);
             return 0;
@@ -364,17 +372,22 @@ static int rw_sync(s_cb_data *dat) {
 			
 			int swnum, val;
 			int rc = sscanf(boundary, "%d %d", &swnum, &val);
-			if (rc < 2 || swnum < 0 || swnum > 7) {
+			if (rc < 2 || swnum < 0 || swnum > 9) {
 				vpi_printf("Warning: malformed switch command. Ignoring...\n");
 				vpi_mcd_flush(1);
 				return 0;
 			}
 			
-			swnum = 7 - swnum;
+			swnum = (NUM_LEDS - 1) - swnum;
 			
+            //vpi_printf("Setting SW %d to %d\n", swnum, val);
+            
 			vpi_mcd_flush(1);
 			
 			f->button_vals[swnum] = (val) ? '1' : '0';
+            
+            //vpi_printf("button_vals is now [%s]\n", f->button_vals);
+            //vpi_mcd_flush(1);
 			
 			s_vpi_value new_vals = {
 				.format = vpiBinStrVal,
@@ -397,7 +410,7 @@ static int rw_sync(s_cb_data *dat) {
 //Helper function to register fake FPGA input/output callback
 static void reg_rw_sync_cb(fake_fpga *f) {
     //Register printer callback, if not already done
-    if (f->ledrd_cb_reg == 0) {
+    if (f->rwsync_cb_reg == 0) {
         //Desired time units
         s_vpi_time time_type = {
             .type = vpiSimTime
@@ -417,13 +430,84 @@ static void reg_rw_sync_cb(fake_fpga *f) {
         vpi_free_object(cb_handle);
         
         //Signal that the callback is registered so we don't re-register it
-        f->ledrd_cb_reg = 1;
+        f->rwsync_cb_reg = 1;
+    }
+}
+
+//ReadOnlySynch callback that reads VGA control wires at the clock's
+//rising edge. It's up to the person registering this callback that they
+//check the clock's value before registering this callback
+static int rising_edge(s_cb_data *dat) {
+    //Grab FPGA state from callback user data
+    fake_fpga *f = (fake_fpga*) dat->user_data;   
+     
+    //Mark that we've received the callback
+    f->rosync_cb_reg = 0;
+    
+    //TODO vga_resetn
+    
+    //Check if plot is asserted
+    s_vpi_value val = {
+        .format = vpiIntVal
+    };
+    vpi_get_value(f->plot, &val);
+    
+    if(val.value.integer != 0) {
+        //Read x, y, colour
+        int x, y, col;
+        
+        vpi_get_value(f->x, &val);
+        x = val.value.integer % 160; //Pixel coordinates wraparound
+        vpi_get_value(f->y, &val);
+        y = val.value.integer % 120;
+        vpi_get_value(f->colour, &val);
+        col = val.value.integer;
+        
+        char line[80];
+        sprintf(line, "c %03d %03d %d\n", x, y, col);
+        
+        int rc = fix_rc(send(server, line, 12, 0));
+        if (rc != 0) {
+            vpi_printf("Could not send command to GUI: %s\n", sockstrerror(rc));
+            vpi_mcd_flush(1);
+            vpi_control(vpiFinish, 1);
+            return 0;
+        }
+    }
+    
+    return 0;
+}
+
+//Helper function to register ReadOnlySynch callback
+static void reg_rising_edge_ro_sync_cb(fake_fpga *f) {
+    //Register printer callback, if not already done
+    if (f->rosync_cb_reg == 0) {
+        //Desired time units
+        s_vpi_time time_type = {
+            .type = vpiSimTime
+        };
+        
+        //Callback info for printing LED value at end of sim time
+        s_cb_data cbdat = {
+            .reason = cbReadOnlySynch,
+            .cb_rtn = rising_edge,
+            .time = &time_type,
+            .user_data = (char *) f
+        };
+        
+        //Register the callback
+        vpiHandle cb_handle = vpi_register_cb(&cbdat);
+        //We'll never need this handle, so free it
+        vpi_free_object(cb_handle);
+        
+        //Signal that the callback is registered so we don't re-register it
+        f->rosync_cb_reg = 1;
     }
 }
 
 //Value-change callback which registers a printer callback for the end of
 //this sim time (so that values have "settled" by the time we print)
-static int value_change(s_cb_data *dat) {
+static int led_value_change(s_cb_data *dat) {
     //Grab FPGA state from callback user data
     fake_fpga *f = (fake_fpga*) dat->user_data;
     
@@ -434,13 +518,82 @@ static int value_change(s_cb_data *dat) {
     }
     
     //Update the LED value string
-    strncpy(f->led_new_val, dat->value->value.str, 8);
-    f->led_new_val[8] = 0;
+    strncpy(f->led_new_val, dat->value->value.str, NUM_LEDS);
+    f->led_new_val[NUM_LEDS] = 0;
     
     //Register fake I/O update callback
     reg_rw_sync_cb(f);
     
     return 0;
+}
+
+//Value-change callback which registers a printer callback for the end of
+//this sim time (so that values have "settled" by the time we print)
+static int hex_value_change(s_cb_data *dat) {
+    //vpi_printf("hex is now [%s]\n", dat->value->value.str);
+    //vpi_mcd_flush(1);
+    //Grab FPGA state from callback user data
+    fake_fpga *f = (fake_fpga*) dat->user_data;
+    
+    //Make sure we have the expected value format
+    if (dat->value->format != vpiHexStrVal) {
+        vpi_printf("Error: incorrect value format, expected vpiBinStrVal\n");
+        vpi_control(vpiFinish, 1);
+    }
+    
+    //Update the HEX value string
+    strncpy(f->hex_new_val, dat->value->value.str, HEX_NYBBLES);
+    f->hex_new_val[HEX_NYBBLES] = 0; //strncpy doesn't add the NUL, so we do it
+    
+    //The GUI has a bug where it doesn't accept 'Z' or 'X'
+    char *p = f->hex_new_val;
+    while (*p) {
+        *p = tolower(*p);
+        p++;
+    }
+    
+    //Register fake I/O update callback
+    reg_rw_sync_cb(f);
+    
+    return 0;
+}
+
+//Value-change callback for the clock. Handles VGA signals.
+static int clk_value_change(s_cb_data *dat) {
+    fake_fpga *f = (fake_fpga*) dat->user_data;
+    
+    //Register fake I/O update callback if this is a rising edge
+    int clkval = dat->value->value.integer;
+    if (clkval) reg_rising_edge_ro_sync_cb(f);
+    return 0;
+}
+
+//Helper function to register a value-change callback
+static void reg_vc_cb(vpiHandle net, PLI_INT32 format, char *user_data, PLI_INT32 (*callback)(struct t_cb_data *)) {
+    //Say we want time in sim units
+    s_vpi_time time_type = {
+        .type = vpiSimTime
+    };
+    
+    //We want a binary string
+    s_vpi_value val_type = {
+        .format = format
+    };
+    
+    //Callback info
+    s_cb_data cbdat = {
+        .reason = cbValueChange,
+        .cb_rtn = callback,
+        .time = &time_type,
+        .value = &val_type,
+        .obj = net,
+        .user_data = user_data
+    };
+    
+    //Register the callback
+    vpiHandle cb_handle = vpi_register_cb(&cbdat);
+    //We don't need the handle to the callback (since we never plan to cancel it)
+    vpi_free_object(cb_handle);
 }
 
 //Prototype to fix circular dependency
@@ -467,7 +620,7 @@ static int keep_alive(s_cb_data *dat) {
 static void reg_keep_alive_cb(fake_fpga *f) {
     s_vpi_time delay = {
         .type = vpiSimTime,
-        .low = 5000,
+        .low = 50000,
         .high = 0
     };
     
@@ -481,56 +634,77 @@ static void reg_keep_alive_cb(fake_fpga *f) {
     f->keep_alive_cb_handle = vpi_register_cb(&cbdat);
 }
 
-//Helper function to register a value-change callback
-static void reg_vc_cb(vpiHandle net, char *user_data) {
-    //Say we want time in sim units
-    s_vpi_time time_type = {
-        .type = vpiSimTime
-    };
-    
-    //We want a binary string
-    s_vpi_value val_type = {
-        .format = vpiBinStrVal
-    };
-    
-    //Callback info
-    s_cb_data cbdat = {
-        .reason = cbValueChange,
-        .cb_rtn = value_change,
-        .time = &time_type,
-        .value = &val_type,
-        .obj = net,
-        .user_data = user_data
-    };
-    
-    //Register the callback
-    vpiHandle cb_handle = vpi_register_cb(&cbdat);
-    //We don't need the handle to the callback (since we never plan to cancel it)
-    vpi_free_object(cb_handle);
-}
-
 //Checks if arguments to my_task are sensible
 static int my_compiletf(char* user_data) {
     //Get handle to this task call instance
     vpiHandle self = vpi_handle(vpiSysTfCall, NULL);
     
-    vpiHandle buttons, leds;
+    vpiHandle clk, buttons, keys, leds, hex;
+    vpiHandle x, y, colour, plot, vga_resetn;
     
     //Iterate through arguments
     vpiHandle args = vpi_iterate(vpiArgument, self);
     if (args == NULL) goto usage_error; //Error if no arguments
     
-    //First argument is buttons
+    //First argument is clock
+    clk = vpi_scan(args);
+    if (clk == NULL) goto usage_error;
+    if (vpi_get(vpiType, clk) != vpiReg) goto usage_error;
+    if (vpi_get(vpiSize, clk) != 1) goto usage_error;
+    
+    //Second argument is buttons
     buttons = vpi_scan(args);
     if (buttons == NULL) goto usage_error;
+    if (vpi_get(vpiType, buttons) != vpiReg) goto usage_error;
+    if (vpi_get(vpiSize, buttons) != 10) goto usage_error;
     
-    //vpi_printf("buttons has type %d and name %s\n", vpi_get(vpiType, buttons), vpi_get_str(vpiFullName, buttons));
-    
-    //Second argument is leds
+    //Third argument is keys
+    keys = vpi_scan(args);
+    if (keys == NULL) goto usage_error;
+    if (vpi_get(vpiType, keys) != vpiReg) goto usage_error;
+    if (vpi_get(vpiSize, keys) != 4) goto usage_error;
+        
+    //Fourth argument is leds
     leds = vpi_scan(args);
     if (leds == NULL) goto usage_error;
+    if (vpi_get(vpiType, leds) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, leds) != 10) goto usage_error;
+        
+    //Fifth argument is hex displays
+    hex = vpi_scan(args);
+    if (hex == NULL) goto usage_error;
+    if (vpi_get(vpiType, hex) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, hex) != 8*NUM_HEX_DISPLAYS) goto usage_error;
     
-    //vpi_printf("leds has type %d and name %s\n", vpi_get(vpiType, leds), vpi_get_str(vpiFullName, leds));
+    //Sixth argument is x
+    x = vpi_scan(args);
+    if (x == NULL) goto usage_error;
+    if (vpi_get(vpiType, x) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, x) != 8) goto usage_error;
+    
+    //Seventh argument is y
+    y = vpi_scan(args);
+    if (y == NULL) goto usage_error;
+    if (vpi_get(vpiType, y) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, y) != 7) goto usage_error;
+    
+    //Eighth argument is colour
+    colour = vpi_scan(args);
+    if (colour == NULL) goto usage_error;
+    if (vpi_get(vpiType, colour) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, colour) != 3) goto usage_error;
+    
+    //Ninth argument is plot
+    plot = vpi_scan(args);
+    if (plot == NULL) goto usage_error;
+    if (vpi_get(vpiType, plot) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, plot) != 1) goto usage_error;
+    
+    //Tenth argument is vga_resetn
+    vga_resetn = vpi_scan(args);
+    if (vga_resetn == NULL) goto usage_error;
+    if (vpi_get(vpiType, vga_resetn) != vpiNet) goto usage_error;
+    if (vpi_get(vpiSize, vga_resetn) != 1) goto usage_error;
     
     //If extra arugments given, throw an error
     if (vpi_scan(args) != NULL) {
@@ -540,11 +714,18 @@ static int my_compiletf(char* user_data) {
     
     //Allocate and initialize fake_fpga state struct
     fake_fpga *f = malloc(sizeof(fake_fpga));
+    f->clk = clk;
     f->buttons = buttons;
+    f->keys = keys;
     f->leds = leds;
-    f->vc_cb_reg = 0;
-    f->ledrd_cb_reg = 0;
-    strcpy(f->button_vals, "00000000");
+    f->hex = hex;
+    f->x = x; f->y = y; f->colour = colour; f->plot = plot; f->vga_resetn = vga_resetn;
+    f->led_vc_cb_reg = 0;
+    f->hex_vc_cb_reg = 0;
+    f->clk_vc_cb_reg = 0;
+    f->rwsync_cb_reg = 0;
+    f->rosync_cb_reg = 0;
+    strcpy(f->button_vals, "0000000000");
     
     //Attach the allocated FPGA state struct to this task call instance
     vpi_put_userdata(self, f);
@@ -581,9 +762,19 @@ static int my_calltf(char* user_data) {
     fake_fpga *f = vpi_get_userdata(self);
     
     //Register a value-change callback for f->leds. 
-    reg_vc_cb(f->leds, (char*)f);
-    //Mark that we've already registered it
-    f->vc_cb_reg = 1;
+    reg_vc_cb(f->leds, vpiBinStrVal, (char*)f, led_value_change);
+    //Mark that we've registered it
+    f->led_vc_cb_reg = 1;
+    
+    //Register a value-change callback for f->hex. 
+    reg_vc_cb(f->hex, vpiHexStrVal, (char*)f, hex_value_change);
+    //Mark that we've registered it
+    f->hex_vc_cb_reg = 1;
+    
+    //Register a value-change callback for f->clk. 
+    reg_vc_cb(f->clk, vpiIntVal, (char*)f, clk_value_change);
+    //Mark that we've registered it
+    f->clk_vc_cb_reg = 1;
     
     //Initial button values
     s_vpi_value init_buttons = {
