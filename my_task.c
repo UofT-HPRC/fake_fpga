@@ -292,6 +292,9 @@ static int rw_sync(s_cb_data *dat) {
 		char line[NUM_LEDS + 2 + 1];
 		//%n in sprintf is broken on MinGW!!!! Why????
 		sprintf(line, "l%s\n", f->led_new_val);
+
+		//vpi_printf("Sent %s", line);
+		//vpi_mcd_flush(1);
 		
 		//Use a regular blocking send on the socket. If internet is slow,
 		//it makes sense that the simulation should also slow down
@@ -310,6 +313,9 @@ static int rw_sync(s_cb_data *dat) {
 		//Use a regular blocking send on the socket. If internet is slow,
 		//it makes sense that the simulation should also slow down
 		send(server, line, HEX_NYBBLES + 2, 0);
+		
+		//vpi_printf("Sent %s", line);
+		//vpi_mcd_flush(1);
 		
 		//Mark that we've seen the updated values
 		f->hex_new_val[0] = 0;
@@ -331,8 +337,8 @@ static int rw_sync(s_cb_data *dat) {
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
     
-    vpi_printf("Waiting for %d ms (disparity = %g ms)\n", disparity_ms, disparity * 1e3);
-    vpi_mcd_flush(1);
+    //vpi_printf("Waiting for %d ms (disparity = %g ms)\n", disparity_ms, disparity * 1e3);
+    //vpi_mcd_flush(1);
     
     struct pollfd pfd = {
         .fd = server,
@@ -340,7 +346,11 @@ static int rw_sync(s_cb_data *dat) {
     };
     
     int rc = poll(&pfd, 1, disparity_ms);
-    if (fix_rc(rc) != 0) {
+    if (fix_rc(rc) < 0) {
+	#ifndef _WIN32
+	//A rare situation where Linux is more complicated than Windows
+	if (errno == EINTR) return 0; //This is not an error
+	#endif
         vpi_printf("poll() got some kind of error: %s", sockstrerror(sockerrno));
         vpi_mcd_flush(1);
         vpi_control(vpiFinish, 1);
@@ -496,9 +506,12 @@ static int rising_edge(s_cb_data *dat) {
         
         char line[80];
         sprintf(line, "c %03d %03d %d\n", x, y, col);
+	
+	//vpi_printf("Sent %s", line);
+	//vpi_mcd_flush(1);
         
         int rc = fix_rc(send(server, line, 12, 0));
-        if (rc != 0) {
+        if (rc <= 0) {
             vpi_printf("Could not send command to GUI: %s\n", sockstrerror(rc));
             vpi_mcd_flush(1);
             vpi_control(vpiFinish, 1);

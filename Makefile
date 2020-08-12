@@ -1,39 +1,22 @@
 # From https://stackoverflow.com/questions/714100/os-detecting-makefile
 
+CFLAGS = -c -Wall -g -fno-diagnostics-show-caret -fpic -Iinclude
+LDFLAGS = -g -shared -Llib -lmtipli
 
 ifeq ($(OS),Windows_NT)
-	CCFLAGS = -IC:\MinGW\msys\1.0\local\include\iverilog -LC:\MinGW\msys\1.0\local\lib -lvpi -lws2_32
-else 
-	CCFLAGS = -I/usr/include/iverilog -lvpi
+	LDFLAGS += -lws2_32
 endif 
 
-all: hello.vvp my_task.vpi
+all: fakefpga.vpi
 
 my_task.o: my_task.c
-	gcc -Wall -g -c -fno-diagnostics-show-caret -fpic my_task.c $(CCFLAGS)
+	gcc my_task.c $(CFLAGS)
 
-my_task.vpi: my_task.o
-	gcc -Wall -g -shared -o my_task.vpi my_task.o $(CCFLAGS)
-
-hello.vvp:	hello.v
-	iverilog -o hello.vvp hello.v
-
-tb.vvp:	tb.v hello.v
-	iverilog -o tb.vvp tb.v
-
-run: tb.vvp my_task.vpi
-	vvp -M. -mmy_task tb.vvp
-
-debug: hello.vvp my_task.vpi
-	gdb --args vvp -M. -mmy_task hello.vvp
-
-fakefpga.o: my_task.c
-	gcc -Wall -g -c -fno-diagnostics-show-caret -fpic -Iinclude -o fakefpga.o my_task.c 
-
-fakefpga.vpi: fakefpga.o
-	gcc -Wall -g -shared -o fakefgpa.vpi fakefpga.o -Llib -lmtipli -lws2_32
+fakefpga.vpi: my_task.o
+	gcc -o fakefpga.vpi my_task.o $(LDFLAGS)
 
 clean:
 	rm -rf *.o
 	rm -rf *.vpi
-	rm -rf *.vvp
+	rm -rf transcript
+
