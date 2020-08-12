@@ -141,7 +141,9 @@
 // - Use sockstrerr(x) instead of strerror(x)
 */
 
-#define TIME_SCALE (1.0/200e-6) //realtime seconds per simulation seconds
+//Used to be a macro, but I made it into a variable in case one day I
+//want to make it a runtime argument
+static float TIME_SCALE = (1.0/100e-6); //realtime seconds per simulation seconds
 
 #define NUM_KEYS 4
 
@@ -207,44 +209,6 @@ static int start_of_sim(s_cb_data *dat) {
 	WSADATA wsa_data;
 	WSAStartup(0x0202, &wsa_data);
 	#endif
-    
-    /*
-     
-    // This is if the simulation is the server, but this code is commented
-    // out because Ruiqi's GUI is a server instead
-    
-    sockfd server = socket(AF_INET, SOCK_STREAM, 0);
-    
-    if (server == INVALID_SOCKET) {
-        vpi_printf("Could not open socket: %s\n", sockstrerror(sockerrno));
-        vpi_control(vpiFinish, 1);
-        return 0;
-    }
-    
-    struct sockaddr_in local = {
-        .sin_family = AF_INET,
-        .sin_port = htons(5555)
-    };
-    
-    int rc = fix_rc(bind(server, (struct sockaddr*) &local, sizeof(struct sockaddr_in)));
-    if (rc < 0) {
-        vpi_printf("Could not bind to port 5555: %s\n", sockstrerror(rc));
-        vpi_control(vpiFinish, 1);
-        return 0;
-    }
-    
-    rc = fix_rc(listen(server, 1));
-    if (rc < 0) {
-        vpi_printf("Could not start listening: %s\n", sockstrerror(rc));
-        vpi_control(vpiFinish, 1);
-        return 0;
-    }
-    
-    vpi_printf("Listening for incoming connections...\n");
-    vpi_mcd_flush(1);
-    
-    client = accept(server, NULL, NULL);
-    */
     
     server = socket(AF_INET, SOCK_STREAM, 0);
     
@@ -336,7 +300,7 @@ static int rw_sync(s_cb_data *dat) {
     
     //Don't actually wait if the waiting time is less than 5 ms
     if (disparity_ms < 5) disparity_ms = 0;
-    
+
     //vpi_printf("Waiting for %d ms (disparity = %g ms)\n", disparity_ms, disparity * 1e3);
     //vpi_mcd_flush(1);
     
@@ -510,7 +474,7 @@ static int rising_edge(s_cb_data *dat) {
 	//vpi_printf("Sent %s", line);
 	//vpi_mcd_flush(1);
         
-        int rc = fix_rc(send(server, line, 12, 0));
+        int rc = send(server, line, 12, 0);
         if (rc <= 0) {
             vpi_printf("Could not send command to GUI: %s\n", sockstrerror(rc));
             vpi_mcd_flush(1);
