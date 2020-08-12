@@ -76,7 +76,7 @@ module main	(
     assign HEX[idx(0,"BL")] = pattern[14];
     assign HEX[idx(0,"TL")] = pattern[15];
     
-    //Clear out everything else
+    //Clear out everything else except middle 4 segments
     assign HEX[idx(0,"TR")] = 1;
     assign HEX[idx(0,"BR")] = 1;
     assign HEX[idx(0,"C")] = 1;
@@ -86,13 +86,14 @@ module main	(
         assign HEX[idx(i,"BR")] = 1;
         assign HEX[idx(i,"TL")] = 1;
         assign HEX[idx(i,"BL")] = 1;
-        assign HEX[idx(i,"C")] = 1;
+        assign HEX[idx(i,"C")] = KEY[4 - i];
         assign HEX[idx(i,"D")] = 1;
     end endgenerate
     assign HEX[idx(5,"TL")] = 1;
     assign HEX[idx(5,"BL")] = 1;
     assign HEX[idx(5,"C")] = 1;
     assign HEX[idx(5,"D")] = 1;
+    
     
     //Nice VGA demo
     

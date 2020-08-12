@@ -143,10 +143,11 @@
 
 #define TIME_SCALE (1.0/20e-3) //realtime seconds per simulation seconds
 
+#define NUM_KEYS 4
+
 #define NUM_LEDS 10
 
 #define NUM_HEX_DISPLAYS 6
-
 #define HEX_NYBBLES (2*NUM_HEX_DISPLAYS)
 
 typedef struct _fake_fpga {
@@ -165,6 +166,7 @@ typedef struct _fake_fpga {
     char hex_new_val[HEX_NYBBLES + 1]; //Same idea as LEDs but for HEX
     
     char button_vals[NUM_LEDS + 1]; //Keep track of button states for displaying
+    char key_vals[NUM_KEYS + 1];
     
     vpiHandle keep_alive_cb_handle; //We need to cancel keep_alive callbacks
                                     //when the simulation ends
@@ -372,7 +374,7 @@ static int rw_sync(s_cb_data *dat) {
 			
 			int swnum, val;
 			int rc = sscanf(boundary, "%d %d", &swnum, &val);
-			if (rc < 2 || swnum < 0 || swnum > 9) {
+			if (rc < 2 || swnum < 0 || swnum >= NUM_LEDS) {
 				vpi_printf("Warning: malformed switch command. Ignoring...\n");
 				vpi_mcd_flush(1);
 				return 0;
@@ -395,6 +397,38 @@ static int rw_sync(s_cb_data *dat) {
 			};
 			
 			vpi_put_value(f->buttons, &new_vals, NULL, vpiNoDelay);
+		} else if(!strcmp(msg, "KEY")) {
+			if (!boundary) {
+				vpi_printf("Warning: malformed key command. Ignoring...\n");
+				vpi_mcd_flush(1);
+				return 0;
+			}
+			
+			int keynum, val;
+			int rc = sscanf(boundary, "%d %d", &keynum, &val);
+			if (rc < 2 || keynum < 0 || keynum >= NUM_KEYS) {
+				vpi_printf("Warning: malformed key command. Ignoring...\n");
+				vpi_mcd_flush(1);
+				return 0;
+			}
+			
+			keynum = (NUM_KEYS - 1) - keynum;
+			
+            vpi_printf("Setting KEY %d to %d\n", keynum, val);
+            
+			vpi_mcd_flush(1);
+			
+			f->key_vals[keynum] = (val) ? '1' : '0';
+            
+            //vpi_printf("button_vals is now [%s]\n", f->button_vals);
+            //vpi_mcd_flush(1);
+			
+			s_vpi_value new_vals = {
+				.format = vpiBinStrVal,
+				.value = {f->key_vals}
+			};
+			
+			vpi_put_value(f->keys, &new_vals, NULL, vpiNoDelay);
 		} else if (!strcmp(msg, "end")) {
 			vpi_control(vpiFinish, 1);
 			return 0;
@@ -726,6 +760,7 @@ static int my_compiletf(char* user_data) {
     f->rwsync_cb_reg = 0;
     f->rosync_cb_reg = 0;
     strcpy(f->button_vals, "0000000000");
+    strcpy(f->key_vals, "0000");
     
     //Attach the allocated FPGA state struct to this task call instance
     vpi_put_userdata(self, f);
@@ -776,16 +811,18 @@ static int my_calltf(char* user_data) {
     //Mark that we've registered it
     f->clk_vc_cb_reg = 1;
     
-    //Initial button values
-    s_vpi_value init_buttons = {
+    //Apply initial button values immediately
+    s_vpi_value init_val = {
         .format = vpiBinStrVal,
         .value = {
             .str = f->button_vals
         }
     };
+    vpi_put_value(f->buttons, &init_val, NULL, vpiNoDelay);
     
-    //Apply initial button values immediately
-    vpi_put_value(f->buttons, &init_buttons, NULL, vpiNoDelay);
+    //Apply initial key values immediately
+    init_val.value.str = f->key_vals;
+    vpi_put_value(f->keys, &init_val, NULL, vpiNoDelay);
     
     //Also hook up our keep-alive callback
     reg_keep_alive_cb(f);
