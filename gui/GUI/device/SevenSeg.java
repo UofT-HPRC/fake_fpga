@@ -1,0 +1,85 @@
+package GUI.device;
+
+import javafx.scene.Group;
+import javafx.scene.layout.AnchorPane;
+import javafx.scene.paint.Color;
+import javafx.scene.shape.*;
+
+/**
+ *       0
+ *     -----
+ * 5  |    | 1
+ *    --6--
+ * 4 |    | 2
+ *   -----
+ *     3
+ */
+public class SevenSeg extends AnchorPane {
+    private final Rectangle[] strokes;
+
+    public SevenSeg() {
+        super();
+        this.setHeight(80);
+        this.setWidth(72);
+        this.setStyle("-fx-background-color: gray; -fx-padding: 4px");
+        Group group = new Group();
+        this.getChildren().add(group);
+
+        strokes = new Rectangle[7];
+        strokes[0] = new Rectangle(24, 4);
+        strokes[0].setX(11);
+        strokes[0].setY(7);
+
+        strokes[3] = new Rectangle(24, 4);
+        strokes[3].setX(11);
+        strokes[3].setY(63);
+
+        strokes[6] = new Rectangle(24, 4);
+        strokes[6].setX(11);
+        strokes[6].setY(35);
+
+
+        strokes[1] = new Rectangle(4, 24);
+        strokes[1].setX(35);
+        strokes[1].setY(11);
+        strokes[2] = new Rectangle(4, 24);
+        strokes[2].setX(35);
+        strokes[2].setY(39);
+
+        strokes[4] = new Rectangle(4, 24);
+        strokes[4].setX(7);
+        strokes[4].setY(39);
+
+        strokes[5] = new Rectangle(4, 24);
+        strokes[5].setX(7);
+        strokes[5].setY(11);
+
+
+        for (int i = 0; i < 7; i++) {
+            group.getChildren().add(strokes[i]);
+            strokes[i].setFill(Color.LIGHTPINK);
+        }
+
+    }
+
+    private boolean decodeColor(int val, int shift) {
+        return ((val >> shift) & 1) == 1;
+    }
+
+    public void setColor(boolean signal, int val) {
+        if (signal) {
+            for (int i = 0; i < 7; i++) {
+                if (decodeColor(val, i)) {
+                    strokes[i].setFill(Color.RED);
+                } else {
+                    strokes[i].setFill(Color.LIGHTGRAY);
+                }
+            }
+        } else {
+            for (int i = 0; i < 7; i++) {
+                strokes[i].setFill(Color.LIGHTPINK);
+
+            }
+        }
+    }
+}
