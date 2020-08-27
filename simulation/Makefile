@@ -1,10 +1,11 @@
 # From https://stackoverflow.com/questions/714100/os-detecting-makefile
 
-CFLAGS = -m32 -static -c -Wall -g -fno-diagnostics-show-caret -fpic -Iinclude
-LDFLAGS = -m32 -static -g -shared -Llib -lmtipli
+CFLAGS = -static -c -Wall -g -fno-diagnostics-show-caret -fpic -Iinclude
+LDFLAGS = -shared -g -Llib -lmtipli
 
 ifeq ($(OS),Windows_NT)
-	LDFLAGS += -lws2_32
+	CFLAGS += -m32
+	LDFLAGS += -m32 -lws2_32
 endif 
 
 all: fakefpga.vpi
