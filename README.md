@@ -1,5 +1,8 @@
 # fake_fpga
-A GUI pretending to be a DE1 for visualizing Verilog sims
+A GUI pretending to be a DE1 for visualizing Verilog sims. Please see the 
+latest release (right-hand side of this page) for a pre-compiled Windows
+version. Otherwise, you can download the source code, compile it, and
+run it.
 
 # Compiling
 
