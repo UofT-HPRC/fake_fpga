@@ -17,7 +17,7 @@ module main	(
     always @(*) LED[9] <= SW[9];
     
     genvar i;
-    generate for(i = 0; i < 9; i = i + 1) begin
+    generate for(i = 0; i < 9; i = i + 1) begin : graycodeleds
         always @(SW[i], LED[i+1]) LED[i] <= LED[i+1] ^ SW[i];
     end endgenerate
     
@@ -81,7 +81,7 @@ module main	(
     assign HEX[idx(0,"BR")] = 1;
     assign HEX[idx(0,"C")] = 1;
     assign HEX[idx(0,"D")] = SW[0];
-    generate for (i = 1; i < 5; i = i + 1) begin
+    generate for (i = 1; i < 5; i = i + 1) begin : clearunusedsegs
         assign HEX[idx(i,"TR")] = 1;
         assign HEX[idx(i,"BR")] = 1;
         assign HEX[idx(i,"TL")] = 1;

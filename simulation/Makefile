@@ -5,7 +5,7 @@ LDFLAGS = -shared -g -Llib -lmtipli
 
 ifeq ($(OS),Windows_NT)
 	CFLAGS += -m32
-	LDFLAGS += -m32 -lws2_32
+	LDFLAGS += -m32 -static -lws2_32
 endif 
 
 all: fakefpga.vpi
