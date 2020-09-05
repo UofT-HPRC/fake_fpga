@@ -3,8 +3,6 @@
 
 //This testbench is designed to hide the details of using the VPI code
 
-//`include "synthtest.vo"
-
 module tb();
 
 reg CLOCK_50 = 0;        // 50 MHz clock, scaled down for simulation
@@ -41,5 +39,13 @@ main DUT (
     .plot(plot),
     .vga_resetn(vga_resetn)
 );
+
+integer i;
+generate for (i = 0; i < 6; i = i + 1) begin : assign_unused
+	assign HEX[8*i - 1] = 0;
+end endgenerate
+
+//+nowarn 3691
+//Or 3116?
 
 endmodule
