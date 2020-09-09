@@ -40,12 +40,9 @@ main DUT (
     .vga_resetn(vga_resetn)
 );
 
-integer i;
-generate for (i = 0; i < 6; i = i + 1) begin : assign_unused
+genvar i;
+generate for (i = 1; i <= 6; i = i + 1) begin : assign_unused
 	assign HEX[8*i - 1] = 0;
 end endgenerate
-
-//+nowarn 3691
-//Or 3116?
 
 endmodule

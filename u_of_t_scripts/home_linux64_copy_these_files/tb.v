@@ -14,7 +14,7 @@ wire [7:0] x;            // VGA pixel coordinates
 wire [6:0] y;
 wire [2:0] colour;       // VGA pixel colour (0-7)
 wire plot;               // Pixel drawn when this is pulsed
-wire vga_resetn;         // VGA reset to black when this is pulsed (UNAVAILABLE)
+wire vga_resetn;         // VGA reset to black when this is pulsed
 
 initial $fake_fpga(CLOCK_50, SW, KEY, LED, HEX, x, y, colour, plot, vga_resetn);
 
@@ -40,8 +40,8 @@ main DUT (
     .vga_resetn(vga_resetn)
 );
 
-integer i;
-generate for (i = 0; i < 6; i = i + 1) begin : assign_unused
+genvar i;
+generate for (i = 1; i <= 6; i = i + 1) begin : assign_unused
 	assign HEX[8*i - 1] = 0;
 end endgenerate
 
