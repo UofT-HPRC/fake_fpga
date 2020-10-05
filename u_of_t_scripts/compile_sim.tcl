@@ -9,4 +9,4 @@ load_package flow
 execute_module -tool map
 execute_module -tool eda
 
-file copy "simulation/modelsim/$quartus(project).vo" "simulation/modelsim/main.vo"
+file copy -force "simulation/modelsim/$quartus(project).vo" "simulation/modelsim/main.vo"
