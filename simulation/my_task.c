@@ -293,6 +293,7 @@ static int rw_sync(s_cb_data *dat) {
     double real_time = ((double) (now.tv_sec - sim_start.tv_sec) 
                         + 1e-6 * (double) (now.tv_usec - sim_start.tv_usec));
     double sim_time_ns = (double) dat->time->low / 1000.0;
+    sim_time_ns += (double) dat->time->high * 4294967.296; // = 2^32 / 1000
     double scaled_sim_time = sim_time_ns*1e-9 * TIME_SCALE;
     double disparity = (scaled_sim_time - real_time);
     
